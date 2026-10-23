@@ -16,3 +16,15 @@ leads.csv
 venv/
 .idea/
 .vscode/
+# Private backups and process locks
+backups/
+*.db-*
+*.sqlite3-*
+*.lock
+.pytest_cache/
+.coverage
+htmlcov/
+*.sqlite
+*.sqlite-*
+*.csv
+.ruff_cache/

@@ -1,17 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
-import csv
 from datetime import datetime, timedelta
 import html
-import json
 import logging
 import os
-from pathlib import Path
-import re
 import sqlite3
-import tempfile
+import uuid
 from typing import Any, Awaitable, Callable, Dict
 from zoneinfo import ZoneInfo
 
@@ -23,10 +18,9 @@ from aiogram.exceptions import (
     TelegramNetworkError,
     TelegramRetryAfter,
 )
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.base import BaseStorage, StateType, StorageKey
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
@@ -39,7 +33,65 @@ from aiogram.types import (
     TelegramObject,
 )
 
+from database import (
+    parse_ref_tag as parse_ref_tag,
+    SQLiteStorage as SQLiteStorage,
+    now_moscow as now_moscow,
+    init_db as init_db,
+    normalize_phone as normalize_phone,
+    update_funnel_session_sync as update_funnel_session_sync,
+    update_funnel_session as update_funnel_session,
+    reset_funnel_session_sync as reset_funnel_session_sync,
+    reset_funnel_session as reset_funnel_session,
+    cancel_funnel_session_sync as cancel_funnel_session_sync,
+    cancel_funnel_session as cancel_funnel_session,
+    record_event_sync as record_event_sync,
+    record_event as record_event,
+    save_lead_sync as save_lead_sync,
+    save_lead as save_lead,
+    claim_lead_sync as claim_lead_sync,
+    claim_lead as claim_lead,
+    mark_delivered_sync as mark_delivered_sync,
+    mark_delivered as mark_delivered,
+    mark_delivery_error_sync as mark_delivery_error_sync,
+    mark_delivery_error as mark_delivery_error,
+    get_delivery_queue_sync as get_delivery_queue_sync,
+    get_delivery_queue as get_delivery_queue,
+    recover_stale_deliveries_sync as recover_stale_deliveries_sync,
+    recover_stale_deliveries as recover_stale_deliveries,
+    record_lead_activity_sync as record_lead_activity_sync,
+    record_lead_activity as record_lead_activity,
+    assign_lead_to_manager_sync as assign_lead_to_manager_sync,
+    assign_lead_to_manager as assign_lead_to_manager,
+    update_lead_note_sync as update_lead_note_sync,
+    update_lead_note as update_lead_note,
+    update_lead_status_sync as update_lead_status_sync,
+    update_lead_status as update_lead_status,
+    get_lead_by_id_sync as get_lead_by_id_sync,
+    generate_export_csv_sync as generate_export_csv_sync,
+    fetch_stats_sync as fetch_stats_sync,
+    get_abandoned_sessions_sync as get_abandoned_sessions_sync,
+    get_abandoned_sessions as get_abandoned_sessions,
+    mark_followup_sent_sync as mark_followup_sent_sync,
+    mark_followup_sent as mark_followup_sent,
+    mark_funnel_blocked_sync as mark_funnel_blocked_sync,
+    mark_funnel_blocked as mark_funnel_blocked,
+    list_leads_sync as list_leads_sync,
+    retry_delivery_sync as retry_delivery_sync,
+    connect as connect,
+    BUSINESS_STATUSES as BUSINESS_STATUSES,
+    claim_followup_sync as claim_followup_sync,
+    remember_attribution_sync as remember_attribution_sync,
+    fetch_analytics_sync as fetch_analytics_sync,
+    retention_cleanup_sync as retention_cleanup_sync,
+    request_erasure_sync as request_erasure_sync,
+    backup_database as backup_database,
+)
+from aiogram.fsm.storage.memory import SimpleEventIsolation
+from exports import sanitize_excel_cell as sanitize_excel_cell
 from tariffs import (
+    render_tariff,
+    tariff_available,
     CATEGORIES_INFO,
     TARIFFS,
     get_categories_kb,
@@ -65,79 +117,12 @@ STALE_DELIVERY_MINUTES = 10
 MAX_RETRY_ATTEMPTS = 10
 
 
-BUSINESS_STATUSES = {
-    "новая",
-    "в работе",
-    "связались",
-    "назначено",
-    "подключено",
-    "отказ",
-    "не дозвонились",
-}
-
-
 TIME_SLOTS = {
     "time_morning": "Утро (09:00–12:00)",
     "time_day": "День (12:00–17:00)",
     "time_evening": "Вечер (17:00–21:00)",
     "time_any": "В любое время",
 }
-
-
-AGENTS_MAP = {
-    "alex": "Александр",
-    "alexander": "Александр",
-    "sasha": "Александр",
-    "sergey": "Сергей",
-    "serg": "Сергей",
-}
-
-
-def parse_ref_tag(raw_tag: str | None) -> tuple[str, str, str, str]:
-    """
-    Возвращает:
-    ref_tag, agent_code, agent_name, house_tag.
-
-    Разрешённые примеры:
-    alex
-    alex_dom12
-    sasha
-    sasha_dom12
-    sergey
-    sergey_dom12
-
-    Все неизвестные значения считаются прямым переходом.
-    """
-    if not raw_tag:
-        return "direct", "direct", "Прямой переход", ""
-
-    clean = re.sub(
-        r"[^a-zA-Z0-9_\-а-яА-Я]",
-        "",
-        str(raw_tag),
-    )[:64]
-
-    if not clean:
-        return "direct", "direct", "Прямой переход", ""
-
-    parts = clean.split("_", 1)
-    code = parts[0].lower()
-    house_tag = parts[1][:48] if len(parts) > 1 else ""
-
-    agent_name = AGENTS_MAP.get(code)
-    if agent_name is None:
-        return "direct", "direct", "Прямой переход", ""
-
-    normalized_ref_tag = code
-    if house_tag:
-        normalized_ref_tag = f"{code}_{house_tag}"
-
-    return (
-        normalized_ref_tag,
-        code,
-        agent_name,
-        house_tag,
-    )
 
 
 class ThrottlingMiddleware(BaseMiddleware):
@@ -193,1265 +178,6 @@ class ThrottlingMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
-def sanitize_excel_cell(value: Any) -> str:
-    """
-    Защита CSV от формульных инъекций при открытии в Excel.
-    """
-    if value is None:
-        return ""
-
-    text = str(value)
-    text = text.replace("\r", " ").replace("\n", " ")
-
-    if text.startswith(("=", "+", "-", "@")):
-        return "'" + text
-
-    return text
-
-
-class SQLiteStorage(BaseStorage):
-    """
-    SQLite storage для FSM Aiogram.
-
-    Все соединения создаются на короткое время в том потоке, где
-    выполняется конкретная синхронная операция.
-    """
-
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self._lock = asyncio.Lock()
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            self.db_path,
-            timeout=DB_TIMEOUT,
-        )
-        connection.execute("PRAGMA busy_timeout = 10000")
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
-
-    @staticmethod
-    def _key(storage_key: StorageKey) -> str:
-        return (
-            f"{storage_key.bot_id}:"
-            f"{storage_key.chat_id}:"
-            f"{storage_key.user_id}:"
-            f"{storage_key.thread_id}:"
-            f"{storage_key.business_connection_id}:"
-            f"{storage_key.destiny}"
-        )
-
-    async def set_state(
-        self,
-        key: StorageKey,
-        state: StateType = None,
-    ) -> None:
-        state_name = state.state if state else None
-
-        async with self._lock:
-            await asyncio.to_thread(
-                self._set_state_sync,
-                self._key(key),
-                state_name,
-            )
-
-    def _set_state_sync(
-        self,
-        key: str,
-        state_name: str | None,
-    ) -> None:
-        with self._connect() as connection:
-            if state_name is None:
-                connection.execute(
-                    "DELETE FROM fsm_storage WHERE storage_key = ?",
-                    (key,),
-                )
-                return
-
-            connection.execute(
-                """
-                INSERT INTO fsm_storage(storage_key, state, data)
-                VALUES (?, ?, '{}')
-                ON CONFLICT(storage_key) DO UPDATE SET
-                    state = excluded.state
-                """,
-                (key, state_name),
-            )
-
-    async def get_state(self, key: StorageKey) -> str | None:
-        async with self._lock:
-            return await asyncio.to_thread(
-                self._get_state_sync,
-                self._key(key),
-            )
-
-    def _get_state_sync(self, key: str) -> str | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT state
-                FROM fsm_storage
-                WHERE storage_key = ?
-                """,
-                (key,),
-            ).fetchone()
-
-        return row[0] if row else None
-
-    async def set_data(
-        self,
-        key: StorageKey,
-        data: dict[str, Any],
-    ) -> None:
-        encoded = json.dumps(
-            data,
-            ensure_ascii=False,
-        )
-
-        async with self._lock:
-            await asyncio.to_thread(
-                self._set_data_sync,
-                self._key(key),
-                encoded,
-            )
-
-    def _set_data_sync(
-        self,
-        key: str,
-        encoded: str,
-    ) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO fsm_storage(storage_key, state, data)
-                VALUES (?, NULL, ?)
-                ON CONFLICT(storage_key) DO UPDATE SET
-                    data = excluded.data
-                """,
-                (key, encoded),
-            )
-
-    async def get_data(
-        self,
-        key: StorageKey,
-    ) -> dict[str, Any]:
-        async with self._lock:
-            encoded = await asyncio.to_thread(
-                self._get_data_sync,
-                self._key(key),
-            )
-
-        if not encoded:
-            return {}
-
-        try:
-            result = json.loads(encoded)
-        except json.JSONDecodeError:
-            return {}
-
-        return result if isinstance(result, dict) else {}
-
-    def _get_data_sync(self, key: str) -> str | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT data
-                FROM fsm_storage
-                WHERE storage_key = ?
-                """,
-                (key,),
-            ).fetchone()
-
-        return row[0] if row else None
-
-    async def close(self) -> None:
-        # Соединения не удерживаются объектом storage.
-        return None
-
-
-def now_moscow() -> str:
-    return datetime.now(MOSCOW_TZ).strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
-
-def init_db(db_path: str) -> None:
-    Path(db_path).resolve().parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = NORMAL")
-        connection.execute("PRAGMA busy_timeout = 10000")
-        connection.execute("PRAGMA foreign_keys = ON")
-
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS leads (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ref_tag TEXT NOT NULL DEFAULT 'direct',
-                agent_code TEXT NOT NULL DEFAULT 'direct',
-                agent_name TEXT NOT NULL DEFAULT 'Прямой переход',
-                house_tag TEXT NOT NULL DEFAULT '',
-                user_id INTEGER,
-                username TEXT,
-                address TEXT NOT NULL,
-                service TEXT NOT NULL,
-                action_type TEXT NOT NULL DEFAULT 'Подключение',
-                name TEXT NOT NULL,
-                phone TEXT NOT NULL,
-                call_time TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'новая',
-                notification_status TEXT NOT NULL DEFAULT 'ожидает',
-                claimed_at TEXT,
-                delivered_at TEXT,
-                delivery_attempts INTEGER NOT NULL DEFAULT 0,
-                last_delivery_error TEXT,
-                crm_chat_id INTEGER,
-                crm_message_id INTEGER,
-                claimed_by_user_id INTEGER,
-                claimed_by_username TEXT,
-                manager_note TEXT,
-                consent_accepted_at TEXT,
-                consent_policy_version TEXT,
-                marketing_consent INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
-
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS funnel_sessions (
-                user_id INTEGER PRIMARY KEY,
-                ref_tag TEXT NOT NULL,
-                current_step TEXT NOT NULL,
-                started_at TEXT NOT NULL,
-                last_activity_at TEXT NOT NULL,
-                followup_sent INTEGER NOT NULL DEFAULT 0,
-                completed INTEGER NOT NULL DEFAULT 0,
-                cancelled INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
-
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS fsm_storage (
-                storage_key TEXT PRIMARY KEY,
-                state TEXT,
-                data TEXT NOT NULL DEFAULT '{}'
-            )
-            """
-        )
-
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS funnel_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                ref_tag TEXT NOT NULL,
-                event_name TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS lead_status_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                lead_id INTEGER NOT NULL,
-                old_status TEXT,
-                new_status TEXT NOT NULL,
-                changed_by INTEGER NOT NULL,
-                changed_at TEXT NOT NULL
-            )
-            """
-        )
-
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS lead_activity (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                lead_id INTEGER NOT NULL,
-                actor_user_id INTEGER NOT NULL,
-                actor_username TEXT,
-                action TEXT NOT NULL,
-                payload TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-
-        columns = {
-            row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(leads)"
-            ).fetchall()
-        }
-
-        migrations = {
-            "agent_code": (
-                "TEXT NOT NULL DEFAULT 'direct'"
-            ),
-            "agent_name": (
-                "TEXT NOT NULL DEFAULT 'Прямой переход'"
-            ),
-            "house_tag": (
-                "TEXT NOT NULL DEFAULT ''"
-            ),
-            "action_type": (
-                "TEXT NOT NULL DEFAULT 'Подключение'"
-            ),
-            "crm_chat_id": "INTEGER",
-            "crm_message_id": "INTEGER",
-            "claimed_by_user_id": "INTEGER",
-            "claimed_by_username": "TEXT",
-            "manager_note": "TEXT",
-            "claimed_at": "TEXT",
-            "delivered_at": "TEXT",
-            "delivery_attempts": (
-                "INTEGER NOT NULL DEFAULT 0"
-            ),
-            "last_delivery_error": "TEXT",
-            "consent_accepted_at": "TEXT",
-            "consent_policy_version": "TEXT",
-            "marketing_consent": (
-                "INTEGER NOT NULL DEFAULT 0"
-            ),
-        }
-
-        for column, definition in migrations.items():
-            if column not in columns:
-                connection.execute(
-                    f'ALTER TABLE leads ADD COLUMN "{column}" {definition}'
-                )
-
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_leads_agent
-            ON leads(agent_code, created_at)
-            """
-        )
-
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_leads_status
-            ON leads(status)
-            """
-        )
-
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_leads_notification
-            ON leads(notification_status, delivery_attempts)
-            """
-        )
-
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_funnel_sessions
-            ON funnel_sessions(
-                completed,
-                cancelled,
-                followup_sent,
-                last_activity_at
-            )
-            """
-        )
-
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_lead_activity_lead
-            ON lead_activity(lead_id, created_at)
-            """
-        )
-
-
-def normalize_phone(value: str) -> str | None:
-    digits = re.sub(r"\D", "", value or "")
-
-    if len(digits) == 10 and digits.startswith("9"):
-        digits = "7" + digits
-    elif len(digits) == 11 and digits.startswith("8"):
-        digits = "7" + digits[1:]
-    elif len(digits) == 11 and digits.startswith("7"):
-        pass
-    else:
-        return None
-
-    if not re.fullmatch(r"79\d{9}", digits):
-        return None
-
-    return f"+{digits}"
-
-
-def update_funnel_session_sync(
-    db_path: str,
-    user_id: int,
-    ref_tag: str,
-    step: str,
-    completed: bool = False,
-    cancelled: bool = False,
-) -> None:
-    """
-    Обновляет текущую сессию, сохраняя исходное состояние
-    completed/cancelled, если текущий переход не меняет его.
-    """
-    now = now_moscow()
-
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA busy_timeout = 10000")
-
-        connection.execute(
-            """
-            INSERT INTO funnel_sessions (
-                user_id,
-                ref_tag,
-                current_step,
-                started_at,
-                last_activity_at,
-                followup_sent,
-                completed,
-                cancelled
-            )
-            VALUES (?, ?, ?, ?, ?, 0, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                ref_tag = excluded.ref_tag,
-                current_step = excluded.current_step,
-                last_activity_at = excluded.last_activity_at,
-                completed = CASE
-                    WHEN excluded.completed = 1 THEN 1
-                    ELSE funnel_sessions.completed
-                END,
-                cancelled = CASE
-                    WHEN excluded.cancelled = 1 THEN 1
-                    ELSE funnel_sessions.cancelled
-                END
-            """,
-            (
-                user_id,
-                ref_tag,
-                step,
-                now,
-                now,
-                int(completed),
-                int(cancelled),
-            ),
-        )
-
-
-async def update_funnel_session(
-    db_path: str,
-    user_id: int,
-    ref_tag: str,
-    step: str,
-    completed: bool = False,
-    cancelled: bool = False,
-) -> None:
-    await asyncio.to_thread(
-        update_funnel_session_sync,
-        db_path,
-        user_id,
-        ref_tag,
-        step,
-        completed,
-        cancelled,
-    )
-
-
-def reset_funnel_session_sync(
-    db_path: str,
-    user_id: int,
-    ref_tag: str,
-    step: str,
-) -> None:
-    """
-    Начинает новый сценарий пользователя.
-
-    В отличие от обычного update сбрасывает completed, cancelled
-    и followup_sent, чтобы повторный /start снова участвовал
-    в follow-up и аналитике.
-    """
-    now = now_moscow()
-
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA busy_timeout = 10000")
-
-        connection.execute(
-            """
-            INSERT INTO funnel_sessions (
-                user_id,
-                ref_tag,
-                current_step,
-                started_at,
-                last_activity_at,
-                followup_sent,
-                completed,
-                cancelled
-            )
-            VALUES (?, ?, ?, ?, ?, 0, 0, 0)
-            ON CONFLICT(user_id) DO UPDATE SET
-                ref_tag = excluded.ref_tag,
-                current_step = excluded.current_step,
-                started_at = excluded.started_at,
-                last_activity_at = excluded.last_activity_at,
-                followup_sent = 0,
-                completed = 0,
-                cancelled = 0
-            """,
-            (
-                user_id,
-                ref_tag,
-                step,
-                now,
-                now,
-            ),
-        )
-
-
-async def reset_funnel_session(
-    db_path: str,
-    user_id: int,
-    ref_tag: str,
-    step: str,
-) -> None:
-    await asyncio.to_thread(
-        reset_funnel_session_sync,
-        db_path,
-        user_id,
-        ref_tag,
-        step,
-    )
-
-
-def cancel_funnel_session_sync(
-    db_path: str,
-    user_id: int,
-) -> None:
-    """
-    Отменяет текущую сессию, не меняя ref_tag.
-    """
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA busy_timeout = 10000")
-
-        connection.execute(
-            """
-            UPDATE funnel_sessions
-            SET current_step = 'cancelled',
-                last_activity_at = ?,
-                cancelled = 1
-            WHERE user_id = ?
-            """,
-            (
-                now_moscow(),
-                user_id,
-            ),
-        )
-
-
-async def cancel_funnel_session(
-    db_path: str,
-    user_id: int,
-) -> None:
-    await asyncio.to_thread(
-        cancel_funnel_session_sync,
-        db_path,
-        user_id,
-    )
-
-
-def record_event_sync(
-    db_path: str,
-    user_id: int,
-    ref_tag: str,
-    event_name: str,
-) -> None:
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute(
-            """
-            INSERT INTO funnel_events(
-                user_id,
-                ref_tag,
-                event_name,
-                created_at
-            )
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                ref_tag,
-                event_name,
-                now_moscow(),
-            ),
-        )
-
-
-async def record_event(
-    db_path: str,
-    user_id: int,
-    ref_tag: str,
-    event_name: str,
-) -> None:
-    await asyncio.to_thread(
-        record_event_sync,
-        db_path,
-        user_id,
-        ref_tag,
-        event_name,
-    )
-
-
-def save_lead_sync(
-    db_path: str,
-    data: dict[str, Any],
-) -> tuple[int, bool, int | None]:
-    phone = data["phone"]
-    now = datetime.now(MOSCOW_TZ)
-    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    duplicate_since = (
-        now - timedelta(days=30)
-    ).strftime("%Y-%m-%d %H:%M:%S")
-
-    ref_tag, agent_code, agent_name, house_tag = parse_ref_tag(
-        data.get("ref_tag")
-    )
-
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA busy_timeout = 10000")
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("BEGIN IMMEDIATE")
-
-        previous = connection.execute(
-            """
-            SELECT id
-            FROM leads
-            WHERE phone = ?
-              AND created_at >= ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (
-                phone,
-                duplicate_since,
-            ),
-        ).fetchone()
-
-        is_duplicate = previous is not None
-        previous_id = previous[0] if previous else None
-        status = "повторная" if is_duplicate else "новая"
-
-        cursor = connection.execute(
-            """
-            INSERT INTO leads (
-                ref_tag,
-                agent_code,
-                agent_name,
-                house_tag,
-                user_id,
-                username,
-                address,
-                service,
-                action_type,
-                name,
-                phone,
-                call_time,
-                created_at,
-                status,
-                notification_status,
-                consent_accepted_at,
-                consent_policy_version,
-                marketing_consent
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                ref_tag,
-                agent_code,
-                agent_name,
-                house_tag,
-                data.get("user_id"),
-                data.get("username"),
-                str(data["address"])[:300],
-                str(data["service"])[:100],
-                data.get("action_type", "Подключение"),
-                str(data["name"])[:100],
-                phone,
-                str(data["call_time"])[:100],
-                now_str,
-                status,
-                "ожидает",
-                data.get("consent_accepted_at"),
-                data.get("consent_policy_version"),
-                int(bool(data.get("marketing_consent"))),
-            ),
-        )
-
-        lead_id = int(cursor.lastrowid)
-
-    return lead_id, is_duplicate, previous_id
-
-
-async def save_lead(
-    db_path: str,
-    data: dict[str, Any],
-) -> tuple[int, bool, int | None]:
-    return await asyncio.to_thread(
-        save_lead_sync,
-        db_path,
-        data,
-    )
-
-
-def claim_lead_sync(
-    db_path: str,
-    lead_id: int,
-) -> bool:
-    """
-    Атомарно резервирует заявку для delivery worker.
-    """
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA busy_timeout = 10000")
-
-        cursor = connection.execute(
-            """
-            UPDATE leads
-            SET notification_status = 'отправляется',
-                claimed_at = ?,
-                delivery_attempts = delivery_attempts + 1,
-                last_delivery_error = NULL
-            WHERE id = ?
-              AND notification_status IN ('ожидает', 'ошибка')
-              AND delivery_attempts < ?
-            """,
-            (
-                now_moscow(),
-                lead_id,
-                MAX_RETRY_ATTEMPTS,
-            ),
-        )
-
-        return cursor.rowcount == 1
-
-
-async def claim_lead(
-    db_path: str,
-    lead_id: int,
-) -> bool:
-    return await asyncio.to_thread(
-        claim_lead_sync,
-        db_path,
-        lead_id,
-    )
-def mark_delivered_sync(
-    db_path: str,
-    lead_id: int,
-    chat_id: int,
-    message_id: int,
-) -> bool:
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA busy_timeout = 10000")
-
-        cursor = connection.execute(
-            """
-            UPDATE leads
-            SET notification_status = 'доставлено',
-                delivered_at = ?,
-                claimed_at = NULL,
-                crm_chat_id = ?,
-                crm_message_id = ?
-            WHERE id = ?
-              AND notification_status = 'отправляется'
-            """,
-            (
-                now_moscow(),
-                chat_id,
-                message_id,
-                lead_id,
-            ),
-        )
-
-        return cursor.rowcount == 1
-
-
-async def mark_delivered(
-    db_path: str,
-    lead_id: int,
-    chat_id: int,
-    message_id: int,
-) -> bool:
-    return await asyncio.to_thread(
-        mark_delivered_sync,
-        db_path,
-        lead_id,
-        chat_id,
-        message_id,
-    )
-
-
-def mark_delivery_error_sync(
-    db_path: str,
-    lead_id: int,
-    error_text: str,
-) -> bool:
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA busy_timeout = 10000")
-
-        cursor = connection.execute(
-            """
-            UPDATE leads
-            SET notification_status = 'ошибка',
-                claimed_at = NULL,
-                last_delivery_error = ?
-            WHERE id = ?
-              AND notification_status = 'отправляется'
-            """,
-            (
-                str(error_text)[:1000],
-                lead_id,
-            ),
-        )
-
-        return cursor.rowcount == 1
-
-
-async def mark_delivery_error(
-    db_path: str,
-    lead_id: int,
-    error_text: str,
-) -> bool:
-    return await asyncio.to_thread(
-        mark_delivery_error_sync,
-        db_path,
-        lead_id,
-        error_text,
-    )
-
-
-def get_delivery_queue_sync(
-    db_path: str,
-    limit: int = 50,
-) -> list[tuple]:
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA busy_timeout = 10000")
-
-        return connection.execute(
-            """
-            SELECT
-                id,
-                ref_tag,
-                address,
-                service,
-                name,
-                phone,
-                call_time,
-                created_at,
-                username,
-                user_id,
-                status,
-                action_type,
-                agent_name,
-                house_tag,
-                claimed_by_username,
-                manager_note,
-                crm_chat_id,
-                crm_message_id
-            FROM leads
-            WHERE notification_status IN ('ожидает', 'ошибка')
-              AND delivery_attempts < ?
-            ORDER BY id ASC
-            LIMIT ?
-            """,
-            (
-                MAX_RETRY_ATTEMPTS,
-                max(1, min(limit, 100)),
-            ),
-        ).fetchall()
-
-
-async def get_delivery_queue(
-    db_path: str,
-    limit: int = 50,
-) -> list[tuple]:
-    return await asyncio.to_thread(
-        get_delivery_queue_sync,
-        db_path,
-        limit,
-    )
-
-
-def recover_stale_deliveries_sync(
-    db_path: str,
-) -> int:
-    threshold = (
-        datetime.now(MOSCOW_TZ)
-        - timedelta(minutes=STALE_DELIVERY_MINUTES)
-    ).strftime("%Y-%m-%d %H:%M:%S")
-
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA busy_timeout = 10000")
-
-        cursor = connection.execute(
-            """
-            UPDATE leads
-            SET notification_status = 'ожидает',
-                claimed_at = NULL
-            WHERE notification_status = 'отправляется'
-              AND claimed_at IS NOT NULL
-              AND claimed_at < ?
-            """,
-            (threshold,),
-        )
-
-        return cursor.rowcount
-
-
-async def recover_stale_deliveries(
-    db_path: str,
-) -> int:
-    return await asyncio.to_thread(
-        recover_stale_deliveries_sync,
-        db_path,
-    )
-
-
-def record_lead_activity_sync(
-    db_path: str,
-    lead_id: int,
-    actor_user_id: int,
-    actor_username: str | None,
-    action: str,
-    payload: str | None = None,
-) -> None:
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA busy_timeout = 10000")
-
-        connection.execute(
-            """
-            INSERT INTO lead_activity (
-                lead_id,
-                actor_user_id,
-                actor_username,
-                action,
-                payload,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                lead_id,
-                actor_user_id,
-                actor_username,
-                action,
-                payload,
-                now_moscow(),
-            ),
-        )
-
-
-async def record_lead_activity(
-    db_path: str,
-    lead_id: int,
-    actor_user_id: int,
-    actor_username: str | None,
-    action: str,
-    payload: str | None = None,
-) -> None:
-    await asyncio.to_thread(
-        record_lead_activity_sync,
-        db_path,
-        lead_id,
-        actor_user_id,
-        actor_username,
-        action,
-        payload,
-    )
-
-
-def assign_lead_to_manager_sync(
-    db_path: str,
-    lead_id: int,
-    user_id: int,
-    username: str,
-) -> bool:
-    manager_username = (
-        f"@{username}"
-        if username
-        else f"id:{user_id}"
-    )
-
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA busy_timeout = 10000")
-        connection.execute("BEGIN IMMEDIATE")
-
-        cursor = connection.execute(
-            """
-            UPDATE leads
-            SET claimed_by_user_id = ?,
-                claimed_by_username = ?,
-                status = 'в работе'
-            WHERE id = ?
-              AND claimed_by_user_id IS NULL
-            """,
-            (
-                user_id,
-                manager_username,
-                lead_id,
-            ),
-        )
-
-        if cursor.rowcount != 1:
-            return False
-
-        connection.execute(
-            """
-            INSERT INTO lead_status_history (
-                lead_id,
-                old_status,
-                new_status,
-                changed_by,
-                changed_at
-            )
-            SELECT
-                id,
-                status,
-                'в работе',
-                ?,
-                ?
-            FROM leads
-            WHERE id = ?
-            """,
-            (
-                user_id,
-                now_moscow(),
-                lead_id,
-            ),
-        )
-
-        return True
-
-
-async def assign_lead_to_manager(
-    db_path: str,
-    lead_id: int,
-    user_id: int,
-    username: str,
-) -> bool:
-    return await asyncio.to_thread(
-        assign_lead_to_manager_sync,
-        db_path,
-        lead_id,
-        user_id,
-        username,
-    )
-
-
-def update_lead_note_sync(
-    db_path: str,
-    lead_id: int,
-    note: str,
-) -> bool:
-    normalized_note = " ".join(
-        str(note).split()
-    ).strip()[:500]
-
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA busy_timeout = 10000")
-
-        cursor = connection.execute(
-            """
-            UPDATE leads
-            SET manager_note = ?
-            WHERE id = ?
-            """,
-            (
-                normalized_note,
-                lead_id,
-            ),
-        )
-
-        return cursor.rowcount == 1
-
-
-async def update_lead_note(
-    db_path: str,
-    lead_id: int,
-    note: str,
-) -> bool:
-    return await asyncio.to_thread(
-        update_lead_note_sync,
-        db_path,
-        lead_id,
-        note,
-    )
-
-
-def update_lead_status_sync(
-    db_path: str,
-    lead_id: int,
-    new_status: str,
-    changed_by: int,
-) -> bool:
-    if new_status not in BUSINESS_STATUSES:
-        return False
-
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA busy_timeout = 10000")
-        connection.execute("BEGIN IMMEDIATE")
-
-        old_row = connection.execute(
-            """
-            SELECT status
-            FROM leads
-            WHERE id = ?
-            """,
-            (lead_id,),
-        ).fetchone()
-
-        if old_row is None:
-            return False
-
-        old_status = old_row[0]
-
-        if old_status == new_status:
-            return True
-
-        connection.execute(
-            """
-            UPDATE leads
-            SET status = ?
-            WHERE id = ?
-            """,
-            (
-                new_status,
-                lead_id,
-            ),
-        )
-
-        connection.execute(
-            """
-            INSERT INTO lead_status_history (
-                lead_id,
-                old_status,
-                new_status,
-                changed_by,
-                changed_at
-            )
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                lead_id,
-                old_status,
-                new_status,
-                changed_by,
-                now_moscow(),
-            ),
-        )
-
-        return True
-
-
-async def update_lead_status(
-    db_path: str,
-    lead_id: int,
-    new_status: str,
-    changed_by: int,
-) -> bool:
-    return await asyncio.to_thread(
-        update_lead_status_sync,
-        db_path,
-        lead_id,
-        new_status,
-        changed_by,
-    )
-
-
-def get_lead_by_id_sync(
-    db_path: str,
-    lead_id: int,
-) -> tuple | None:
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA busy_timeout = 10000")
-
-        return connection.execute(
-            """
-            SELECT
-                id,
-                ref_tag,
-                address,
-                service,
-                name,
-                phone,
-                call_time,
-                created_at,
-                username,
-                user_id,
-                status,
-                action_type,
-                agent_name,
-                house_tag,
-                claimed_by_username,
-                manager_note,
-                crm_chat_id,
-                crm_message_id
-            FROM leads
-            WHERE id = ?
-            """,
-            (lead_id,),
-        ).fetchone()
-
-
 def build_agent_text(
     row: tuple,
     delivery_prefix: str = "🚨 <b>НОВАЯ ЗАЯВКА",
@@ -1477,58 +203,25 @@ def build_agent_text(
         crm_message_id,
     ) = row
 
-    safe_agent_name = html.escape(
-        str(agent_name or "Прямой переход")
-    )
-    safe_house_tag = html.escape(
-        str(house_tag or "")
-    )
-    safe_ref_tag = html.escape(
-        str(ref_tag or "direct")
-    )
-    safe_address = html.escape(
-        str(address or "")
-    )
-    safe_service = html.escape(
-        str(service or "")
-    )
-    safe_name = html.escape(
-        str(name or "")
-    )
-    safe_phone = html.escape(
-        str(phone or "")
-    )
-    safe_call_time = html.escape(
-        str(call_time or "")
-    )
-    safe_username = html.escape(
-        str(username or "отсутствует")
-    )
-    safe_created_at = html.escape(
-        str(created_at or "")
-    )
-    safe_status = html.escape(
-        str(status or "")
-    )
-    safe_action_type = html.escape(
-        str(action_type or "Подключение")
-    )
+    safe_agent_name = html.escape(str(agent_name or "Прямой переход"))
+    safe_house_tag = html.escape(str(house_tag or ""))
+    safe_ref_tag = html.escape(str(ref_tag or "direct"))
+    safe_address = html.escape(str(address or ""))
+    safe_service = html.escape(str(service or ""))
+    safe_name = html.escape(str(name or ""))
+    safe_phone = html.escape(str(phone or ""))
+    safe_call_time = html.escape(str(call_time or ""))
+    safe_username = html.escape(str(username or "отсутствует"))
+    safe_created_at = html.escape(str(created_at or ""))
+    safe_status = html.escape(str(status or ""))
+    safe_action_type = html.escape(str(action_type or "Подключение"))
 
-    house_info = (
-        f" (дом: {safe_house_tag})"
-        if safe_house_tag
-        else ""
-    )
+    house_info = f" (дом: {safe_house_tag})" if safe_house_tag else ""
 
-    claimed_text = (
-        html.escape(str(claimed_by))
-        if claimed_by
-        else "<i>не назначен</i>"
-    )
+    claimed_text = html.escape(str(claimed_by)) if claimed_by else "<i>не назначен</i>"
 
     note_text = (
-        "\n📝 <b>Заметка:</b> "
-        f"<i>{html.escape(str(manager_note))}</i>"
+        f"\n📝 <b>Заметка:</b> <i>{html.escape(str(manager_note))}</i>"
         if manager_note
         else ""
     )
@@ -1540,12 +233,12 @@ def build_agent_text(
         f"<b>{safe_action_type}</b>\n"
         f"💼 <b>Агент:</b> "
         f"<b>{safe_agent_name}</b>{house_info}\n"
-        f"🏷 <b>Метка QR:</b> "
+        f"🏷 <b>Источник / кампания:</b> "
         f"<code>{safe_ref_tag}</code>\n"
         f"🏠 <b>Адрес:</b> {safe_address}\n"
         f"📦 <b>Тариф:</b> {safe_service}\n"
         f"👤 <b>Имя:</b> {safe_name}\n"
-        f'📞 <b>Телефон:</b> '
+        f"📞 <b>Телефон:</b> "
         f'<a href="tel:{safe_phone}">{safe_phone}</a>\n'
         f"⏰ <b>Время звонка:</b> "
         f"{safe_call_time}\n"
@@ -1579,31 +272,29 @@ def lead_actions_kb(
             [claim_button],
             [
                 InlineKeyboardButton(
-                    text="📞 Связался",
-                    callback_data=(
-                        f"lead_status:{lead_id}:связались"
-                    ),
+                    text="📞 Связались с клиентом",
+                    callback_data=(f"lead_status:{lead_id}:связались"),
                 ),
                 InlineKeyboardButton(
                     text="📅 Назначено",
-                    callback_data=(
-                        f"lead_status:{lead_id}:назначено"
-                    ),
+                    callback_data=(f"lead_status:{lead_id}:назначено"),
                 ),
             ],
             [
                 InlineKeyboardButton(
                     text="✅ Подключён",
-                    callback_data=(
-                        f"lead_status:{lead_id}:подключено"
-                    ),
+                    callback_data=(f"lead_status:{lead_id}:подключено"),
                 ),
                 InlineKeyboardButton(
                     text="❌ Отказ",
-                    callback_data=(
-                        f"lead_status:{lead_id}:отказ"
-                    ),
+                    callback_data=(f"lead_status:{lead_id}:отказ"),
                 ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="☎️ Не удалось связаться",
+                    callback_data=f"lead_status:{lead_id}:не дозвонились",
+                )
             ],
             [
                 InlineKeyboardButton(
@@ -1623,7 +314,13 @@ def get_start_kb() -> InlineKeyboardMarkup:
                     text="🚀 Подобрать тариф и подключение",
                     callback_data="start_process",
                 )
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📞 Получить консультацию", callback_data="consultation"
+                )
+            ],
+            [InlineKeyboardButton(text="🔐 О данных", callback_data="privacy_info")],
         ]
     )
 
@@ -1636,7 +333,12 @@ def get_phone_kb() -> ReplyKeyboardMarkup:
                     text="📱 Поделиться контактом",
                     request_contact=True,
                 )
-            ]
+            ],
+            [
+                KeyboardButton(text="/back"),
+                KeyboardButton(text="/menu"),
+                KeyboardButton(text="/cancel"),
+            ],
         ],
         resize_keyboard=True,
         one_time_keyboard=True,
@@ -1677,13 +379,14 @@ def get_time_kb() -> InlineKeyboardMarkup:
 
 def get_consent_kb(
     privacy_policy_url: str,
+    submission_id: str = "",
 ) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="✅ Отправить заявку",
-                    callback_data="consent_accept",
+                    callback_data=f"consent_accept:{submission_id}",
                 )
             ],
             [
@@ -1691,6 +394,10 @@ def get_consent_kb(
                     text="✏️ Изменить данные",
                     callback_data="consent_edit",
                 )
+            ],
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data="form_back"),
+                InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu"),
             ],
             [
                 InlineKeyboardButton(
@@ -1706,13 +413,19 @@ def cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data="form_back"),
+                InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu"),
+            ],
+            [
                 InlineKeyboardButton(
                     text="❌ Отменить",
                     callback_data="cancel_order",
                 )
-            ]
+            ],
         ]
     )
+
+
 def consent_text(
     data: dict[str, Any],
     personal_data_operator: str,
@@ -1728,7 +441,8 @@ def consent_text(
         "Нажимая кнопку «Отправить заявку», вы даёте согласие "
         "на обработку указанных персональных данных для связи "
         "по вопросу подключения услуг.\n\n"
-        f"Оператор: <i>{html.escape(personal_data_operator)}</i>"
+        f"Оператор: <i>{html.escape(personal_data_operator)}</i>\n"
+        "Отменить оформление: /cancel. Запросить удаление данных: /delete_me."
     )
 
 
@@ -1786,9 +500,391 @@ router = Router()
 router.message.middleware(ThrottlingMiddleware(0.4))
 router.callback_query.middleware(ThrottlingMiddleware(0.3))
 
-_submission_locks: defaultdict[int, asyncio.Lock] = defaultdict(
-    asyncio.Lock
+
+class CustomerContextMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        message = event.message if isinstance(event, CallbackQuery) else event
+        user = event.from_user
+        if user is None or not isinstance(message, Message):
+            if isinstance(event, CallbackQuery):
+                await event.answer("Сообщение недоступно", show_alert=True)
+            return
+        is_customer = message.chat.type == "private"
+        if not is_customer:
+            text = message.text or ""
+            is_staff_action = (
+                (
+                    isinstance(event, CallbackQuery)
+                    and (event.data or "").startswith(("lead_", "noop"))
+                )
+                or text.startswith(
+                    ("/stats", "/export", "/cancel", "/lead", "/delivery")
+                )
+                or await data["state"].get_state()
+                == ManagerNoteFSM.waiting_for_note_text.state
+            )
+            if not is_staff_action:
+                await message.answer("Оформить заявку можно в личном чате с ботом.")
+                if isinstance(event, CallbackQuery):
+                    await event.answer()
+                return
+        result = await handler(event, data)
+        if is_customer:
+            state = data.get("state")
+            current = await state.get_state() if state else None
+            if current and current.startswith("OrderFSM:"):
+                values = await state.get_data()
+                await update_funnel_session(
+                    data["db_path"], user.id, values.get("ref_tag", "direct"), current
+                )
+        return result
+
+
+router.message.outer_middleware(CustomerContextMiddleware())
+router.callback_query.outer_middleware(CustomerContextMiddleware())
+
+
+@router.message(Command("menu"))
+async def cmd_menu(message: Message, state: FSMContext, db_path: str) -> None:
+    await state.clear()
+    await cancel_funnel_session(db_path, message.from_user.id)
+    await message.answer("Главное меню", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Выберите действие:", reply_markup=get_start_kb())
+
+
+@router.callback_query(F.data == "main_menu")
+async def callback_menu(
+    callback: CallbackQuery, state: FSMContext, db_path: str
+) -> None:
+    await callback.answer()
+    if callback.message:
+        await state.clear()
+        await cancel_funnel_session(db_path, callback.from_user.id)
+        await callback.message.answer(
+            "Главное меню", reply_markup=ReplyKeyboardRemove()
+        )
+        await callback.message.answer("Выберите действие:", reply_markup=get_start_kb())
+
+
+@router.callback_query(F.data == "privacy_info")
+async def privacy_info(
+    callback: CallbackQuery,
+    privacy_policy_url: str,
+    personal_data_operator: str,
+    retention_days: int,
+) -> None:
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            f"Контакты нужны для ответа на заявку. Оператор данных: {html.escape(personal_data_operator)}.\n"
+            f"Срок хранения по настройке: {retention_days} дней; обезличивание выполняет оператор. "
+            "Для запроса удаления: /delete_me. Это прекращает напоминания. "
+            "Копии в CRM-чате и ранее скачанные файлы оператор удаляет отдельно.\n"
+            f'<a href="{html.escape(privacy_policy_url, quote=True)}">Политика обработки данных</a>',
+            parse_mode="HTML",
+        )
+
+
+@router.message(Command("delete_me"))
+async def delete_me(message: Message, state: FSMContext, db_path: str) -> None:
+    await state.clear()
+    await asyncio.to_thread(request_erasure_sync, db_path, message.from_user.id)
+    await message.answer(
+        "Запрос на удаление данных зарегистрирован, напоминания прекращены. "
+        "Оператор должен обработать запрос, включая копии в CRM и выгрузках.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.callback_query(F.data == "consultation")
+async def consultation(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_path: str,
+    personal_data_operator: str,
+    privacy_policy_url: str,
+) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    tag, code, name, campaign = await asyncio.to_thread(
+        remember_attribution_sync, db_path, callback.from_user.id, None
+    )
+    await state.clear()
+    await state.update_data(
+        ref_tag=tag,
+        agent_code=code,
+        agent_name=name,
+        house_tag=campaign,
+        service="Консультация",
+        service_key="consultation",
+        selected_category="consultation",
+        address="",
+        action_type="Заказ звонка",
+        submission_id=uuid.uuid4().hex,
+    )
+    await state.set_state(OrderFSM.waiting_for_name)
+    await reset_funnel_session(
+        db_path, callback.from_user.id, tag, OrderFSM.waiting_for_name.state
+    )
+    await callback.message.answer(
+        "Для консультации достаточно имени, телефона и времени звонка. "
+        f"Оператор данных: {html.escape(personal_data_operator)}. "
+        f'<a href="{html.escape(privacy_policy_url, quote=True)}">Политика обработки данных</a>\n\n'
+        "Как к вам обращаться?",
+        parse_mode="HTML",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.callback_query(
+    StateFilter(
+        OrderFSM.waiting_for_name,
+        OrderFSM.waiting_for_phone,
+        OrderFSM.waiting_for_call_time,
+        OrderFSM.waiting_for_consent,
+    ),
+    F.data == "form_back",
 )
+async def form_back(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    current = await state.get_state()
+    if current == OrderFSM.waiting_for_name.state:
+        await state.set_state(OrderFSM.choosing_category)
+        await callback.message.answer(
+            "Выберите категорию:", reply_markup=get_categories_kb()
+        )
+    elif current == OrderFSM.waiting_for_phone.state:
+        await state.set_state(OrderFSM.waiting_for_name)
+        await callback.message.answer("Как к вам обращаться?", reply_markup=cancel_kb())
+    elif current == OrderFSM.waiting_for_call_time.state:
+        await state.set_state(OrderFSM.waiting_for_phone)
+        await callback.message.answer(
+            "Введите ваш номер телефона:", reply_markup=get_phone_kb()
+        )
+    else:
+        await state.set_state(OrderFSM.waiting_for_call_time)
+        await callback.message.answer(
+            "Выберите время звонка:", reply_markup=get_time_kb()
+        )
+
+
+@router.message(Command("leads", "delivery"))
+async def cmd_leads(
+    message: Message,
+    command: CommandObject,
+    admin_ids: list[int],
+    manager_ids: list[int],
+    crm_chat_id: int,
+    db_path: str,
+) -> None:
+    if not message.from_user or message.from_user.id not in set(admin_ids) | set(
+        manager_ids
+    ):
+        return
+    if message.chat.id != crm_chat_id and not (
+        message.chat.type == "private" and message.from_user.id in admin_ids
+    ):
+        return
+    rows = await asyncio.to_thread(
+        list_leads_sync, db_path, delivery_only=command.command == "delivery"
+    )
+    text = (
+        "\n".join(f"№{row[0]} | {row[1]} | CRM: {row[2]} | {row[3]}" for row in rows)
+        or "Заявок нет."
+    )
+    await message.answer(
+        text + "\n\nКарточка: /lead ID (в CRM-чате). Проблемы доставки: /delivery."
+    )
+
+
+@router.message(Command("lead"))
+async def cmd_lead(
+    message: Message,
+    command: CommandObject,
+    admin_ids: list[int],
+    manager_ids: list[int],
+    crm_chat_id: int,
+    db_path: str,
+) -> None:
+    if (
+        not message.from_user
+        or message.from_user.id not in set(admin_ids) | set(manager_ids)
+        or message.chat.id != crm_chat_id
+    ):
+        return
+    if not command.args or not command.args.isdigit():
+        await message.answer("Формат: /lead ID")
+        return
+    row = await asyncio.to_thread(get_lead_by_id_sync, db_path, int(command.args))
+    if not row:
+        await message.answer("Заявка не найдена.")
+        return
+    await message.answer(
+        build_agent_text(row, delivery_prefix="📋 <b>КАРТОЧКА ЗАЯВКИ"),
+        parse_mode="HTML",
+        reply_markup=lead_actions_kb(row[0], row[14]),
+        protect_content=True,
+    )
+
+
+@router.message(Command("retry_delivery"))
+async def cmd_retry_delivery(
+    message: Message, command: CommandObject, admin_ids: list[int], db_path: str
+) -> None:
+    if (
+        not message.from_user
+        or message.from_user.id not in admin_ids
+        or message.chat.type != "private"
+    ):
+        return
+    parts = (command.args or "").split()
+    if len(parts) != 2 or not parts[0].isdigit() or parts[1] != "CONFIRM":
+        await message.answer(
+            "Сначала проверьте CRM: уведомление могло быть доставлено. После проверки для повторной отправки: /retry_delivery ID CONFIRM. Возможен дубль карточки."
+        )
+        return
+    updated = await asyncio.to_thread(retry_delivery_sync, db_path, int(parts[0]))
+    await message.answer(
+        "Доставка поставлена в очередь."
+        if updated
+        else "Нет заявки с подходящим статусом доставки."
+    )
+
+
+@router.message(Command("export"))
+async def cmd_export(
+    message: Message,
+    admin_ids: list[int],
+    db_path: str,
+) -> None:
+    if not message.from_user or message.from_user.id not in admin_ids:
+        return
+    if message.chat.type != "private":
+        await message.answer(
+            "Для выгрузки откройте личный чат с ботом и отправьте /export."
+        )
+        return
+
+    temporary_path: str | None = None
+
+    try:
+        temporary_path, count = await asyncio.to_thread(
+            generate_export_csv_sync,
+            db_path,
+        )
+
+        document = FSInputFile(
+            temporary_path,
+            filename=(f"leads_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"),
+        )
+
+        await message.reply_document(
+            document,
+            caption=f"📊 Экспорт заявок: {count} шт. Удалите файл после использования.",
+            protect_content=True,
+        )
+    except Exception:
+        LOGGER.exception("Ошибка формирования экспорта")
+
+        await message.answer("⚠️ Не удалось сформировать экспорт.")
+    finally:
+        if temporary_path:
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
+
+
+@router.message(Command("stats"))
+async def cmd_stats(
+    message: Message,
+    admin_ids: list[int],
+    db_path: str,
+) -> None:
+    if message.from_user.id not in admin_ids:
+        return
+
+    (
+        today_count,
+        total_count,
+        agents,
+        statuses,
+        houses,
+    ) = await asyncio.to_thread(
+        fetch_stats_sync,
+        db_path,
+    )
+
+    agents_text = "\n".join(
+        f"• <b>{html.escape(str(agent_name))}</b>: {count}"
+        for agent_name, count in agents[:10]
+    )
+
+    statuses_text = "\n".join(
+        f"• <b>{html.escape(str(status))}</b>: {count}"
+        for status, count in statuses[:15]
+    )
+
+    houses_text = "\n".join(
+        f"• <code>{html.escape(str(house))}</code>: {count}"
+        for house, count in houses[:10]
+    )
+
+    await message.answer(
+        "📊 <b>Статистика CRM МТС</b>\n\n"
+        f"📅 Сегодня: <b>{today_count}</b>\n"
+        f"📦 Всего заявок: <b>{total_count}</b>\n\n"
+        f"<b>По агентам:</b>\n"
+        f"{agents_text or 'нет данных'}\n\n"
+        f"<b>По статусам:</b>\n"
+        f"{statuses_text or 'нет данных'}\n\n"
+        f"<b>По меткам домов:</b>\n"
+        f"{houses_text or 'нет данных'}",
+        parse_mode="HTML",
+    )
+
+    analytics = await asyncio.to_thread(fetch_analytics_sync, db_path)
+    sections = [
+        f"Подключено: {analytics['connected']}; конверсия заявка → подключение: {analytics['conversion']:.1f}%"
+    ]
+    for title, key in [
+        ("Категории", "categories"),
+        ("Источники", "sources"),
+        ("Кампании", "campaigns"),
+        ("Даты", "dates"),
+        ("Доставка CRM", "delivery"),
+    ]:
+        sections.append(
+            title
+            + ":\n"
+            + "\n".join(
+                f"• {str(label or 'без метки')[:80]}: {count}"
+                for label, count in analytics[key]
+            )
+        )
+    await message.answer("\n\n".join(sections))
+
+
+@router.message(Command("back"))
+async def cmd_back(message: Message, state: FSMContext) -> None:
+    current = await state.get_state()
+    if current == OrderFSM.waiting_for_phone.state:
+        await state.set_state(OrderFSM.waiting_for_name)
+        await message.answer(
+            "Как к вам обращаться?", reply_markup=ReplyKeyboardRemove()
+        )
+        await message.answer("Введите имя:", reply_markup=cancel_kb())
+    elif current in {
+        OrderFSM.waiting_for_call_time.state,
+        OrderFSM.waiting_for_consent.state,
+    }:
+        await state.set_state(OrderFSM.waiting_for_phone)
+        await message.answer("Введите ваш номер телефона:", reply_markup=get_phone_kb())
+    else:
+        await message.answer("Для возврата к выбору услуги используйте /menu.")
 
 
 @router.message(Command("cancel", "отмена"))
@@ -1804,8 +900,7 @@ async def cmd_cancel(
     )
 
     await message.answer(
-        "❌ Оформление отменено.\n\n"
-        "Чтобы начать заново, отправьте /start.",
+        "❌ Оформление отменено.\n\nЧтобы начать заново, отправьте /start.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -1826,8 +921,7 @@ async def callback_cancel_order(
 
     if callback.message:
         await callback.message.answer(
-            "❌ Оформление отменено.\n\n"
-            "Чтобы начать заново, отправьте /start.",
+            "❌ Оформление отменено.\n\nЧтобы начать заново, отправьте /start.",
             reply_markup=ReplyKeyboardRemove(),
         )
 
@@ -1846,11 +940,13 @@ async def cmd_start(
     state: FSMContext,
     command: CommandObject,
     db_path: str,
+    personal_data_operator: str,
+    privacy_policy_url: str,
 ) -> None:
     user_id = message.from_user.id
 
-    ref_tag, agent_code, agent_name, house_tag = parse_ref_tag(
-        command.args
+    ref_tag, agent_code, agent_name, house_tag = await asyncio.to_thread(
+        remember_attribution_sync, db_path, user_id, command.args
     )
 
     await state.clear()
@@ -1861,6 +957,7 @@ async def cmd_start(
         agent_name=agent_name,
         house_tag=house_tag,
         started_at=now_moscow(),
+        submission_id=uuid.uuid4().hex,
     )
 
     await reset_funnel_session(
@@ -1879,18 +976,19 @@ async def cmd_start(
 
     welcome_agent = ""
 
-    if agent_code != "direct":
+    if agent_code in {"alex", "alexander", "sasha", "sergey", "serg"}:
         welcome_agent = (
-            f"\nВаш персональный консультант: "
-            f"<b>{html.escape(agent_name)}</b>."
+            f"\nВаш персональный консультант: <b>{html.escape(agent_name)}</b>."
         )
 
     await message.answer(
         f"👋 <b>Здравствуйте!</b>{welcome_agent}\n\n"
-        "Я официальный онлайн-помощник по подключению услуг "
-        "<b>МТС</b> по вашему району.\n\n"
+        "Это сервис «МТС Экспресс» для заявок на услуги связи.\n\n"
         "Подберём выгодный тариф и передадим заявку специалисту "
-        "за 1 минуту без ожидания оператора.",
+        "после уточнения региона и условий. Доступность подключения проверяет специалист.\n\n"
+        f"Контакты для ответа обрабатывает {html.escape(personal_data_operator)}. "
+        f'<a href="{html.escape(privacy_policy_url, quote=True)}">Политика обработки данных</a>. '
+        "Запросить удаление: /delete_me.",
         reply_markup=get_start_kb(),
         parse_mode="HTML",
     )
@@ -1913,26 +1011,12 @@ async def process_resume_order(
 
     current_state = await state.get_state()
     data = await state.get_data()
-    user_id = callback.from_user.id
-    ref_tag = data.get("ref_tag", "direct")
-
     await callback.answer()
 
     if not current_state:
-        await state.set_state(OrderFSM.waiting_for_address)
-        await update_funnel_session(
-            db_path=db_path,
-            user_id=user_id,
-            ref_tag=ref_tag,
-            step=OrderFSM.waiting_for_address.state,
-        )
-
         await callback.message.answer(
-            "📍 Давайте продолжим.\n\n"
-            "Напишите город, улицу и номер дома.\n"
-            "Например: <i>ул. Ленина, 45</i>",
-            reply_markup=cancel_kb(),
-            parse_mode="HTML",
+            "Активной заявки нет. Выберите действие в главном меню.",
+            reply_markup=get_start_kb(),
         )
         return
 
@@ -1950,8 +1034,7 @@ async def process_resume_order(
         address = html.escape(str(data.get("address", "")))
 
         await callback.message.answer(
-            f"🏠 Адрес: <b>{address}</b>\n\n"
-            "📋 <b>ВЫБЕРИТЕ КАТЕГОРИЮ УСЛУГ:</b>",
+            f"🏠 Адрес: <b>{address}</b>\n\n📋 <b>ВЫБЕРИТЕ КАТЕГОРИЮ УСЛУГ:</b>",
             reply_markup=get_categories_kb(),
             parse_mode="HTML",
         )
@@ -1980,9 +1063,9 @@ async def process_resume_order(
         service_key = data.get("service_key")
         tariff = TARIFFS.get(service_key)
 
-        if tariff:
+        if tariff and tariff_available(service_key):
             await callback.message.answer(
-                tariff["description"],
+                render_tariff(service_key),
                 reply_markup=get_tariff_actions_kb(),
                 parse_mode="HTML",
             )
@@ -2026,7 +1109,9 @@ async def process_resume_order(
                 data=data,
                 personal_data_operator=personal_data_operator,
             ),
-            reply_markup=get_consent_kb(privacy_policy_url),
+            reply_markup=get_consent_kb(
+                privacy_policy_url, data.get("submission_id", "")
+            ),
             parse_mode="HTML",
         )
         return
@@ -2057,29 +1142,25 @@ async def process_start(
     ref_tag = data.get("ref_tag", "direct")
     user_id = callback.from_user.id
 
-    await state.set_state(OrderFSM.waiting_for_address)
-
-    await update_funnel_session(
-        db_path=db_path,
-        user_id=user_id,
-        ref_tag=ref_tag,
-        step=OrderFSM.waiting_for_address.state,
+    await state.clear()
+    tag, code, name, house = await asyncio.to_thread(
+        remember_attribution_sync, db_path, user_id, ref_tag
     )
-
-    await record_event(
-        db_path=db_path,
-        user_id=user_id,
-        ref_tag=ref_tag,
-        event_name="funnel_started",
+    await state.update_data(
+        ref_tag=tag,
+        agent_code=code,
+        agent_name=name,
+        house_tag=house,
+        submission_id=uuid.uuid4().hex,
     )
-
+    await reset_funnel_session(
+        db_path, user_id, tag, OrderFSM.waiting_for_address.state
+    )
+    await state.update_data(address="")
+    await state.set_state(OrderFSM.choosing_category)
     await callback.message.answer(
-        "📍 <b>Шаг 1 из 6. Ваш адрес</b>\n\n"
-        "Напишите город, улицу и номер дома.\n"
-        "Например: <i>ул. Ленина, 45</i>\n\n"
-        "Адрес нужен для проверки технической возможности подключения.",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML",
+        "Выберите категорию услуг. Цены и доступность зависят от региона и требуют подтверждения специалистом.",
+        reply_markup=get_categories_kb(),
     )
 
 
@@ -2091,18 +1172,14 @@ async def process_address(
 ) -> None:
     address = " ".join(message.text.split()).strip()
 
-    if len(address) < 4:
+    if address.startswith("/") or len(address) < 4:
         await message.answer(
-            "⚠️ Адрес слишком короткий.\n"
-            "Укажите город, улицу и номер дома."
+            "⚠️ Адрес слишком короткий.\nУкажите город, улицу и номер дома."
         )
         return
 
     if len(address) > 300:
-        await message.answer(
-            "⚠️ Слишком длинный адрес. "
-            "Максимум 300 символов."
-        )
+        await message.answer("⚠️ Слишком длинный адрес. Максимум 300 символов.")
         return
 
     await state.update_data(address=address)
@@ -2110,6 +1187,13 @@ async def process_address(
     ref_tag = data.get("ref_tag", "direct")
     user_id = message.from_user.id
 
+    if data.get("service_key"):
+        await state.set_state(OrderFSM.waiting_for_name)
+        await message.answer(
+            "Адрес принят для проверки специалистом. Как к вам обращаться?",
+            reply_markup=cancel_kb(),
+        )
+        return
     await state.set_state(OrderFSM.choosing_category)
 
     await update_funnel_session(
@@ -2137,9 +1221,7 @@ async def process_address(
 
 @router.message(OrderFSM.waiting_for_address)
 async def process_address_invalid(message: Message) -> None:
-    await message.answer(
-        "⚠️ Пожалуйста, отправьте адрес обычным текстовым сообщением."
-    )
+    await message.answer("⚠️ Пожалуйста, отправьте адрес обычным текстовым сообщением.")
 
 
 @router.callback_query(
@@ -2180,7 +1262,10 @@ async def process_category(
     )
 
 
-@router.callback_query(F.data == "action_back_categories")
+@router.callback_query(
+    F.data == "action_back_categories",
+    StateFilter(OrderFSM.waiting_for_service, OrderFSM.viewing_tariff),
+)
 async def process_back_to_categories(
     callback: CallbackQuery,
     state: FSMContext,
@@ -2255,9 +1340,17 @@ async def process_service(
     service_key = callback.data.split(":", 1)[1]
     tariff = TARIFFS.get(service_key)
 
-    if tariff is None:
+    if tariff is None or not tariff_available(service_key):
         await callback.answer(
             "Услуга не найдена.",
+            show_alert=True,
+        )
+        return
+
+    values = await state.get_data()
+    if tariff["category"] != values.get("selected_category"):
+        await callback.answer(
+            "Кнопка из другой категории устарела. Выберите тариф заново.",
             show_alert=True,
         )
         return
@@ -2289,11 +1382,16 @@ async def process_service(
     )
 
     await callback.message.edit_text(
-        tariff["description"],
+        render_tariff(service_key),
         reply_markup=get_tariff_actions_kb(),
         parse_mode="HTML",
     )
-@router.callback_query(F.data == "action_back_tariffs")
+
+
+@router.callback_query(
+    F.data == "action_back_tariffs",
+    StateFilter(OrderFSM.waiting_for_service, OrderFSM.viewing_tariff),
+)
 async def process_back_tariffs(
     callback: CallbackQuery,
     state: FSMContext,
@@ -2342,19 +1440,26 @@ async def process_action(
         )
         return
 
-    action_type = (
-        "Подключение"
-        if callback.data == "action_order"
-        else "Заказ звонка"
-    )
+    action_type = "Подключение" if callback.data == "action_order" else "Заказ звонка"
 
     await callback.answer()
     await state.update_data(action_type=action_type)
+    data = await state.get_data()
+    if (
+        data.get("selected_category") in {"combo", "satellite_tv"}
+        or data.get("service_key") == "b2b_office_net"
+    ):
+        await state.set_state(OrderFSM.waiting_for_address)
+        await callback.message.answer(
+            "Для проверки возможности подключения напишите город, улицу и номер дома. Номер квартиры не нужен. Доступность подтвердит специалист.",
+            reply_markup=cancel_kb(),
+        )
+        return
+    await state.update_data(address="")
     await state.set_state(OrderFSM.waiting_for_name)
 
     await callback.message.answer(
-        "👤 <b>Шаг 3 из 6. Как к вам обращаться?</b>\n\n"
-        "Напишите имя.",
+        "👤 <b>Шаг 3 из 6. Как к вам обращаться?</b>\n\nНапишите имя.",
         reply_markup=cancel_kb(),
         parse_mode="HTML",
     )
@@ -2367,17 +1472,12 @@ async def process_name(
 ) -> None:
     name = " ".join(message.text.split()).strip()
 
-    if len(name) < 2:
-        await message.answer(
-            "⚠️ Имя слишком короткое.\n"
-            "Напишите, как к вам обращаться."
-        )
+    if name.startswith("/") or len(name) < 2:
+        await message.answer("⚠️ Имя слишком короткое.\nНапишите, как к вам обращаться.")
         return
 
     if len(name) > 100:
-        await message.answer(
-            "⚠️ Имя слишком длинное. Максимум 100 символов."
-        )
+        await message.answer("⚠️ Имя слишком длинное. Максимум 100 символов.")
         return
 
     await state.update_data(name=name)
@@ -2396,9 +1496,7 @@ async def process_name(
 
 @router.message(OrderFSM.waiting_for_name)
 async def process_name_invalid(message: Message) -> None:
-    await message.answer(
-        "⚠️ Пожалуйста, напишите имя текстом."
-    )
+    await message.answer("⚠️ Пожалуйста, напишите имя текстом.")
 
 
 @router.message(OrderFSM.waiting_for_phone)
@@ -2411,19 +1509,14 @@ async def process_phone(
     if message.contact:
         contact_user_id = message.contact.user_id
 
-        if (
-            contact_user_id is not None
-            and contact_user_id != message.from_user.id
-        ):
+        if contact_user_id is not None and contact_user_id != message.from_user.id:
             await message.answer(
                 "⚠️ Пожалуйста, отправьте свой собственный номер "
                 "или введите его вручную."
             )
             return
 
-        phone = normalize_phone(
-            message.contact.phone_number
-        )
+        phone = normalize_phone(message.contact.phone_number)
 
     elif message.text:
         phone = normalize_phone(message.text)
@@ -2442,8 +1535,7 @@ async def process_phone(
     await state.set_state(OrderFSM.waiting_for_call_time)
 
     await message.answer(
-        "✅ Номер принят.\n\n"
-        "⏰ <b>Шаг 5 из 6. Когда удобно принять звонок?</b>",
+        "✅ Номер принят.\n\n⏰ <b>Шаг 5 из 6. Когда удобно принять звонок?</b>",
         reply_markup=ReplyKeyboardRemove(),
         parse_mode="HTML",
     )
@@ -2491,7 +1583,7 @@ async def process_call_time(
             data=data,
             personal_data_operator=personal_data_operator,
         ),
-        reply_markup=get_consent_kb(privacy_policy_url),
+        reply_markup=get_consent_kb(privacy_policy_url, data.get("submission_id", "")),
         parse_mode="HTML",
     )
 
@@ -2512,17 +1604,22 @@ async def process_consent_edit(
         return
 
     await callback.answer()
-    await state.set_state(OrderFSM.waiting_for_name)
-
-    await callback.message.answer(
-        "✏️ Введите ваше имя заново.",
-        reply_markup=cancel_kb(),
-    )
+    data = await state.get_data()
+    if data.get("address"):
+        await state.set_state(OrderFSM.waiting_for_address)
+        await callback.message.answer(
+            "Введите исправленный город, улицу и дом:", reply_markup=cancel_kb()
+        )
+    else:
+        await state.set_state(OrderFSM.waiting_for_name)
+        await callback.message.answer(
+            "Введите ваше имя заново:", reply_markup=cancel_kb()
+        )
 
 
 @router.callback_query(
     OrderFSM.waiting_for_consent,
-    F.data == "consent_accept",
+    F.data.startswith("consent_accept:"),
 )
 async def process_consent_accept(
     callback: CallbackQuery,
@@ -2540,111 +1637,97 @@ async def process_consent_accept(
 
     user_id = callback.from_user.id
 
-    async with _submission_locks[user_id]:
-        await callback.answer()
-        data = await state.get_data()
+    await callback.answer()
+    data = await state.get_data()
 
-        required_fields = (
-            "address",
-            "service",
-            "name",
-            "phone",
-            "call_time",
+    if (
+        callback.data != "consent_accept:" + data.get("submission_id", "")
+        or await state.get_state() != OrderFSM.waiting_for_consent.state
+    ):
+        await callback.message.answer(
+            "Эта кнопка устарела. Используйте текущую форму или /menu."
         )
-
-        if not all(data.get(field) for field in required_fields):
-            await state.clear()
-
-            await callback.message.answer(
-                "⚠️ Сессия заявки устарела.\n"
-                "Начните заново: /start"
-            )
-            return
-
-        data["user_id"] = user_id
-        data["username"] = (
-            f"@{callback.from_user.username}"
-            if callback.from_user.username
-            else "отсутствует"
+        return
+    service_key = data.get("service_key")
+    if service_key != "consultation" and not tariff_available(service_key):
+        await state.set_state(OrderFSM.choosing_category)
+        await callback.message.answer(
+            "Предложение больше недоступно. Выберите актуальную услугу.",
+            reply_markup=get_categories_kb(),
         )
-        data["consent_accepted_at"] = now_moscow()
-        data["consent_policy_version"] = policy_version
-        data["marketing_consent"] = False
+        return
+    required_fields = (
+        "service",
+        "name",
+        "phone",
+        "call_time",
+    )
 
-        try:
-            lead_id, is_duplicate, previous_id = await save_lead(
-                db_path=db_path,
-                data=data,
-            )
-        except sqlite3.Error:
-            LOGGER.exception(
-                "Ошибка сохранения заявки пользователя %s",
-                user_id,
-            )
-
-            await callback.message.answer(
-                "⚠️ Не удалось сохранить заявку из-за ошибки базы данных.\n"
-                "Попробуйте ещё раз через минуту."
-            )
-            return
-
-        ref_tag = data.get("ref_tag", "direct")
-
-        await update_funnel_session(
-            db_path=db_path,
-            user_id=user_id,
-            ref_tag=ref_tag,
-            step="completed",
-            completed=True,
-        )
-
-        await record_event(
-            db_path=db_path,
-            user_id=user_id,
-            ref_tag=ref_tag,
-            event_name="consent_accepted",
-        )
-
-        await record_event(
-            db_path=db_path,
-            user_id=user_id,
-            ref_tag=ref_tag,
-            event_name="lead_created",
-        )
-
+    if not all(data.get(field) for field in required_fields):
         await state.clear()
 
-        try:
-            await callback.message.edit_reply_markup(
-                reply_markup=None,
-            )
-        except TelegramBadRequest:
-            pass
+        await callback.message.answer(
+            "⚠️ Сессия заявки устарела.\nНачните заново: /start"
+        )
+        return
 
-        consultant_name = data.get("agent_name") or agent_name
+    data["user_id"] = user_id
+    data["username"] = (
+        f"@{callback.from_user.username}"
+        if callback.from_user.username
+        else "отсутствует"
+    )
+    data["consent_accepted_at"] = now_moscow()
+    data["consent_policy_version"] = policy_version
+    data["marketing_consent"] = False
 
-        if consultant_name == "Прямой переход":
-            consultant_name = agent_name
-
-        duplicate_text = ""
-
-        if is_duplicate and previous_id:
-            duplicate_text = (
-                "\n\nℹ️ Похоже, вы уже оставляли заявку недавно. "
-                "Мы всё равно передали новую заявку специалисту."
-            )
+    try:
+        lead_id, is_duplicate, previous_id = await save_lead(
+            db_path=db_path,
+            data=data,
+        )
+    except (sqlite3.Error, ValueError):
+        LOGGER.exception("Ошибка сохранения заявки")
 
         await callback.message.answer(
-            f"🎉 <b>Заявка №{lead_id} принята!</b>\n\n"
-            f"Специалист <b>{html.escape(str(consultant_name))}</b> "
-            "свяжется с вами в указанное время:\n"
-            f"<b>{html.escape(str(data['call_time']))}</b>\n\n"
-            f"Номер для связи: "
-            f"<code>{html.escape(str(data['phone']))}</code>"
-            f"{duplicate_text}",
-            parse_mode="HTML",
-            reply_markup=ReplyKeyboardRemove(),
+            "⚠️ Не удалось сохранить заявку из-за ошибки базы данных.\n"
+            "Попробуйте ещё раз через минуту."
         )
+        return
+
+    await state.clear()
+
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=None,
+        )
+    except TelegramBadRequest:
+        pass
+
+    consultant_name = data.get("agent_name") or agent_name
+
+    if consultant_name == "Прямой переход":
+        consultant_name = agent_name
+
+    duplicate_text = ""
+
+    if is_duplicate and previous_id:
+        duplicate_text = (
+            "\n\nℹ️ Похоже, вы уже оставляли заявку недавно. "
+            "Если данные не изменились, повторная отправка не создаёт дубль."
+        )
+
+    await callback.message.answer(
+        f"🎉 <b>Заявка №{lead_id} принята!</b>\n\n"
+        f"Специалист <b>{html.escape(str(consultant_name))}</b> "
+        "получит заявку и уточнит условия подключения. Удобное время звонка:\n"
+        f"<b>{html.escape(str(data['call_time']))}</b>\n\n"
+        f"Номер для связи: "
+        f"<code>{html.escape(str(data['phone']))}</code>"
+        f"{duplicate_text}",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 async def manager_access_or_answer(
@@ -2678,9 +1761,7 @@ async def process_lead_claim(
         return
 
     try:
-        lead_id = int(
-            callback.data.split(":", 1)[1]
-        )
+        lead_id = int(callback.data.split(":", 1)[1])
     except (ValueError, AttributeError):
         await callback.answer(
             "Некорректный идентификатор заявки.",
@@ -2712,9 +1793,7 @@ async def process_lead_claim(
         action="claim",
     )
 
-    await callback.answer(
-        "✅ Вы взяли заявку в работу."
-    )
+    await callback.answer("✅ Вы взяли заявку в работу.")
 
     row = await asyncio.to_thread(
         get_lead_by_id_sync,
@@ -2741,7 +1820,7 @@ async def process_lead_claim(
         LOGGER.warning(
             "Не удалось обновить карточку #%s: %s",
             lead_id,
-            exc,
+            type(exc).__name__,
         )
 
 
@@ -2797,9 +1876,7 @@ async def process_lead_status(
         payload=new_status,
     )
 
-    await callback.answer(
-        f"Статус изменён: {new_status}"
-    )
+    await callback.answer(f"Статус изменён: {new_status}")
 
     row = await asyncio.to_thread(
         get_lead_by_id_sync,
@@ -2826,7 +1903,7 @@ async def process_lead_status(
         LOGGER.warning(
             "Не удалось обновить карточку #%s: %s",
             lead_id,
-            exc,
+            type(exc).__name__,
         )
 
 
@@ -2854,9 +1931,7 @@ async def process_start_note(
         return
 
     try:
-        lead_id = int(
-            callback.data.split(":", 1)[1]
-        )
+        lead_id = int(callback.data.split(":", 1)[1])
     except (ValueError, AttributeError):
         await callback.answer(
             "Некорректный идентификатор заявки.",
@@ -2864,9 +1939,7 @@ async def process_start_note(
         )
         return
 
-    await state.set_state(
-        ManagerNoteFSM.waiting_for_note_text
-    )
+    await state.set_state(ManagerNoteFSM.waiting_for_note_text)
 
     await state.update_data(
         note_lead_id=lead_id,
@@ -2877,8 +1950,7 @@ async def process_start_note(
     await callback.answer()
 
     await callback.message.reply(
-        f"📝 Напишите заметку для заявки №{lead_id}.\n"
-        "Для отмены отправьте /cancel.",
+        f"📝 Напишите заметку для заявки №{lead_id}.\nДля отмены отправьте /cancel.",
     )
 
 
@@ -2901,9 +1973,7 @@ async def process_save_note(
         return
 
     if message.chat.id != crm_chat_id:
-        await message.answer(
-            "⛔ Заметки можно добавлять только из CRM-чата."
-        )
+        await message.answer("⛔ Заметки можно добавлять только из CRM-чата.")
         return
 
     data = await state.get_data()
@@ -2915,24 +1985,17 @@ async def process_save_note(
         lead_id = int(raw_lead_id)
     except (TypeError, ValueError):
         await state.clear()
-        await message.answer(
-            "⚠️ Сессия заметки устарела."
-        )
+        await message.answer("⚠️ Сессия заметки устарела.")
         return
 
     note = " ".join(message.text.split()).strip()
 
     if not note:
-        await message.answer(
-            "⚠️ Заметка не может быть пустой."
-        )
+        await message.answer("⚠️ Заметка не может быть пустой.")
         return
 
     if len(note) > 500:
-        await message.answer(
-            "⚠️ Заметка слишком длинная. "
-            "Максимум 500 символов."
-        )
+        await message.answer("⚠️ Заметка слишком длинная. Максимум 500 символов.")
         return
 
     author = message.from_user.username
@@ -2952,9 +2015,7 @@ async def process_save_note(
 
     if not updated:
         await state.clear()
-        await message.answer(
-            "⚠️ Заявка не найдена."
-        )
+        await message.answer("⚠️ Заявка не найдена.")
         return
 
     await record_lead_activity(
@@ -2968,9 +2029,7 @@ async def process_save_note(
 
     await state.clear()
 
-    await message.reply(
-        f"✅ Заметка к заявке №{lead_id} сохранена."
-    )
+    await message.reply(f"✅ Заметка к заявке №{lead_id} сохранена.")
 
     row = await asyncio.to_thread(
         get_lead_by_id_sync,
@@ -3005,271 +2064,8 @@ async def process_save_note(
         LOGGER.warning(
             "Не удалось обновить карточку #%s после заметки: %s",
             lead_id,
-            exc,
+            type(exc).__name__,
         )
-
-
-def generate_export_csv_sync(
-    db_path: str,
-) -> tuple[str, int]:
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA busy_timeout = 10000")
-
-        rows = connection.execute(
-            """
-            SELECT
-                l.id,
-                l.created_at,
-                l.agent_code,
-                l.agent_name,
-                l.house_tag,
-                l.ref_tag,
-                l.address,
-                l.service,
-                l.action_type,
-                l.name,
-                l.phone,
-                l.call_time,
-                l.status,
-                l.claimed_by_username,
-                l.manager_note,
-                l.consent_accepted_at,
-                l.consent_policy_version,
-                COALESCE(
-                    (
-                        SELECT GROUP_CONCAT(
-                            old_status || ' -> ' || new_status
-                            || ' [' || changed_at || ']',
-                            ' | '
-                        )
-                        FROM lead_status_history h
-                        WHERE h.lead_id = l.id
-                    ),
-                    ''
-                ) AS status_history
-            FROM leads l
-            ORDER BY l.id ASC
-            """
-        ).fetchall()
-
-    headers = [
-        "ID",
-        "Дата заявки",
-        "Код агента",
-        "Агент",
-        "Метка дома",
-        "QR-метка",
-        "Адрес",
-        "Тариф",
-        "Цель",
-        "Имя",
-        "Телефон",
-        "Время связи",
-        "Статус",
-        "Менеджер",
-        "Заметка",
-        "Согласие принято",
-        "Версия политики",
-        "История статусов",
-    ]
-
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        delete=False,
-        suffix=".csv",
-        encoding="utf-8-sig",
-        newline="",
-    ) as temporary_file:
-        writer = csv.writer(
-            temporary_file,
-            delimiter=";",
-        )
-
-        writer.writerow(headers)
-
-        for row in rows:
-            writer.writerow(
-                [
-                    sanitize_excel_cell(value)
-                    for value in row
-                ]
-            )
-
-        temporary_path = temporary_file.name
-
-    return temporary_path, len(rows)
-
-
-@router.message(Command("export"))
-async def cmd_export(
-    message: Message,
-    admin_ids: list[int],
-    db_path: str,
-) -> None:
-    if message.from_user.id not in admin_ids:
-        return
-
-    temporary_path: str | None = None
-
-    try:
-        temporary_path, count = await asyncio.to_thread(
-            generate_export_csv_sync,
-            db_path,
-        )
-
-        document = FSInputFile(
-            temporary_path,
-            filename=(
-                f"leads_"
-                f"{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-            ),
-        )
-
-        await message.reply_document(
-            document,
-            caption=f"📊 Экспорт заявок: {count} шт.",
-        )
-    except Exception:
-        LOGGER.exception("Ошибка формирования экспорта")
-
-        await message.answer(
-            "⚠️ Не удалось сформировать экспорт."
-        )
-    finally:
-        if temporary_path:
-            try:
-                os.remove(temporary_path)
-            except OSError:
-                pass
-
-
-def fetch_stats_sync(
-    db_path: str,
-) -> tuple[
-    int,
-    int,
-    list[tuple[str, int]],
-    list[tuple[str, int]],
-    list[tuple[str, int]],
-]:
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA busy_timeout = 10000")
-
-        today = datetime.now(MOSCOW_TZ).strftime(
-            "%Y-%m-%d"
-        )
-
-        today_count = connection.execute(
-            """
-            SELECT COUNT(*)
-            FROM leads
-            WHERE date(created_at) = ?
-            """,
-            (today,),
-        ).fetchone()[0]
-
-        total_count = connection.execute(
-            "SELECT COUNT(*) FROM leads"
-        ).fetchone()[0]
-
-        agents = connection.execute(
-            """
-            SELECT
-                agent_name,
-                COUNT(*)
-            FROM leads
-            GROUP BY agent_name
-            ORDER BY COUNT(*) DESC
-            """
-        ).fetchall()
-
-        statuses = connection.execute(
-            """
-            SELECT
-                status,
-                COUNT(*)
-            FROM leads
-            GROUP BY status
-            ORDER BY COUNT(*) DESC
-            """
-        ).fetchall()
-
-        houses = connection.execute(
-            """
-            SELECT
-                COALESCE(NULLIF(house_tag, ''), 'без метки дома'),
-                COUNT(*)
-            FROM leads
-            GROUP BY house_tag
-            ORDER BY COUNT(*) DESC
-            """
-        ).fetchall()
-
-    return (
-        today_count,
-        total_count,
-        agents,
-        statuses,
-        houses,
-    )
-
-
-@router.message(Command("stats"))
-async def cmd_stats(
-    message: Message,
-    admin_ids: list[int],
-    db_path: str,
-) -> None:
-    if message.from_user.id not in admin_ids:
-        return
-
-    (
-        today_count,
-        total_count,
-        agents,
-        statuses,
-        houses,
-    ) = await asyncio.to_thread(
-        fetch_stats_sync,
-        db_path,
-    )
-
-    agents_text = "\n".join(
-        f"• <b>{html.escape(str(agent_name))}</b>: "
-        f"{count}"
-        for agent_name, count in agents
-    )
-
-    statuses_text = "\n".join(
-        f"• <b>{html.escape(str(status))}</b>: "
-        f"{count}"
-        for status, count in statuses
-    )
-
-    houses_text = "\n".join(
-        f"• <code>{html.escape(str(house))}</code>: "
-        f"{count}"
-        for house, count in houses
-    )
-
-    await message.answer(
-        "📊 <b>Статистика CRM МТС</b>\n\n"
-        f"📅 Сегодня: <b>{today_count}</b>\n"
-        f"📦 Всего заявок: <b>{total_count}</b>\n\n"
-        f"<b>По агентам:</b>\n"
-        f"{agents_text or 'нет данных'}\n\n"
-        f"<b>По статусам:</b>\n"
-        f"{statuses_text or 'нет данных'}\n\n"
-        f"<b>По меткам домов:</b>\n"
-        f"{houses_text or 'нет данных'}",
-        parse_mode="HTML",
-    )
 
 
 async def delivery_worker(
@@ -3316,35 +2112,24 @@ async def delivery_worker(
                     }
 
                     if crm_thread_id is not None:
-                        send_kwargs["message_thread_id"] = (
-                            crm_thread_id
-                        )
+                        send_kwargs["message_thread_id"] = crm_thread_id
 
-                    sent_message = await bot.send_message(
-                        **send_kwargs
-                    )
+                    sent_message = await bot.send_message(**send_kwargs)
 
                 except TelegramRetryAfter as exc:
                     await mark_delivery_error(
                         db_path=db_path,
                         lead_id=lead_id,
-                        error_text=(
-                            f"RetryAfter: {exc.retry_after}"
-                        ),
+                        error_text=(f"RetryAfter: {exc.retry_after}"),
                     )
 
-                    await asyncio.sleep(
-                        float(exc.retry_after)
-                    )
+                    await asyncio.sleep(float(exc.retry_after))
 
-                except TelegramForbiddenError as exc:
+                except TelegramForbiddenError:
                     await mark_delivery_error(
                         db_path=db_path,
                         lead_id=lead_id,
-                        error_text=(
-                            "TelegramForbiddenError: "
-                            f"{exc}"
-                        ),
+                        error_text="TelegramForbiddenError",
                     )
 
                     LOGGER.error(
@@ -3356,33 +2141,33 @@ async def delivery_worker(
                     await mark_delivery_error(
                         db_path=db_path,
                         lead_id=lead_id,
-                        error_text=str(exc),
+                        error_text=type(exc).__name__,
                     )
 
                     LOGGER.warning(
                         "Сетевая ошибка доставки заявки #%s: %s",
                         lead_id,
-                        exc,
+                        type(exc).__name__,
                     )
 
                 except TelegramBadRequest as exc:
                     await mark_delivery_error(
                         db_path=db_path,
                         lead_id=lead_id,
-                        error_text=str(exc),
+                        error_text=type(exc).__name__,
                     )
 
                     LOGGER.error(
                         "Ошибка Telegram API для заявки #%s: %s",
                         lead_id,
-                        exc,
+                        type(exc).__name__,
                     )
 
-                except Exception as exc:
+                except Exception:
                     await mark_delivery_error(
                         db_path=db_path,
                         lead_id=lead_id,
-                        error_text=str(exc),
+                        error_text="UnknownDeliveryError",
                     )
 
                     LOGGER.exception(
@@ -3404,138 +2189,10 @@ async def delivery_worker(
             break
 
         except Exception:
-            LOGGER.exception(
-                "Критическая ошибка delivery worker"
-            )
+            LOGGER.exception("Критическая ошибка delivery worker")
             await asyncio.sleep(10)
 
     LOGGER.info("Delivery worker остановлен")
-
-
-def get_abandoned_sessions_sync(
-    db_path: str,
-    threshold: str,
-    limit: int = 20,
-) -> list[tuple[int, str]]:
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA busy_timeout = 10000")
-
-        return connection.execute(
-            """
-            SELECT user_id, ref_tag
-            FROM funnel_sessions
-            WHERE completed = 0
-              AND cancelled = 0
-              AND followup_sent = 0
-              AND current_step IN (
-                  'OrderFSM:waiting_for_address',
-                  'OrderFSM:choosing_category',
-                  'OrderFSM:waiting_for_service',
-                  'OrderFSM:viewing_tariff',
-                  'waiting_for_address',
-                  'choosing_category',
-                  'waiting_for_service',
-                  'viewing_tariff'
-              )
-              AND last_activity_at <= ?
-            ORDER BY last_activity_at ASC
-            LIMIT ?
-            """,
-            (
-                threshold,
-                max(1, min(limit, 100)),
-            ),
-        ).fetchall()
-
-
-async def get_abandoned_sessions(
-    db_path: str,
-    threshold: str,
-    limit: int = 20,
-) -> list[tuple[int, str]]:
-    return await asyncio.to_thread(
-        get_abandoned_sessions_sync,
-        db_path,
-        threshold,
-        limit,
-    )
-
-
-def mark_followup_sent_sync(
-    db_path: str,
-    user_id: int,
-) -> bool:
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute("PRAGMA busy_timeout = 10000")
-
-        cursor = connection.execute(
-            """
-            UPDATE funnel_sessions
-            SET followup_sent = 1,
-                last_activity_at = ?
-            WHERE user_id = ?
-              AND completed = 0
-              AND cancelled = 0
-              AND followup_sent = 0
-            """,
-            (
-                now_moscow(),
-                user_id,
-            ),
-        )
-
-        return cursor.rowcount == 1
-
-
-async def mark_followup_sent(
-    db_path: str,
-    user_id: int,
-) -> bool:
-    return await asyncio.to_thread(
-        mark_followup_sent_sync,
-        db_path,
-        user_id,
-    )
-
-
-def mark_funnel_blocked_sync(
-    db_path: str,
-    user_id: int,
-) -> None:
-    with sqlite3.connect(
-        db_path,
-        timeout=DB_TIMEOUT,
-    ) as connection:
-        connection.execute(
-            """
-            UPDATE funnel_sessions
-            SET cancelled = 1,
-                current_step = 'blocked',
-                last_activity_at = ?
-            WHERE user_id = ?
-            """,
-            (
-                now_moscow(),
-                user_id,
-            ),
-        )
-
-
-async def mark_funnel_blocked(
-    db_path: str,
-    user_id: int,
-) -> None:
-    await asyncio.to_thread(
-        mark_funnel_blocked_sync,
-        db_path,
-        user_id,
-    )
 
 
 async def followup_worker(
@@ -3544,13 +2201,14 @@ async def followup_worker(
     followup_minutes: int,
     stop_event: asyncio.Event,
 ) -> None:
+    if followup_minutes == 0:
+        return
     LOGGER.info("Follow-up worker запущен")
 
     while not stop_event.is_set():
         try:
             threshold = (
-                datetime.now(MOSCOW_TZ)
-                - timedelta(minutes=followup_minutes)
+                datetime.now(MOSCOW_TZ) - timedelta(minutes=followup_minutes)
             ).strftime("%Y-%m-%d %H:%M:%S")
 
             abandoned = await get_abandoned_sessions(
@@ -3559,10 +2217,14 @@ async def followup_worker(
                 limit=20,
             )
 
-            for user_id, ref_tag in abandoned:
+            for user_id, ref_tag, activity in abandoned:
                 if stop_event.is_set():
                     break
 
+                if not await asyncio.to_thread(
+                    claim_followup_sync, db_path, user_id, threshold, activity
+                ):
+                    continue
                 keyboard = InlineKeyboardMarkup(
                     inline_keyboard=[
                         [
@@ -3595,18 +2257,6 @@ async def followup_worker(
                         parse_mode="HTML",
                     )
 
-                    marked = await mark_followup_sent(
-                        db_path=db_path,
-                        user_id=user_id,
-                    )
-
-                    if not marked:
-                        LOGGER.info(
-                            "Follow-up для пользователя %s "
-                            "уже был обработан",
-                            user_id,
-                        )
-
                 except TelegramForbiddenError:
                     await mark_funnel_blocked(
                         db_path=db_path,
@@ -3627,10 +2277,9 @@ async def followup_worker(
                         )
                     else:
                         LOGGER.warning(
-                            "TelegramBadRequest follow-up "
-                            "для %s: %s",
+                            "TelegramBadRequest follow-up для %s: %s",
                             user_id,
-                            exc,
+                            type(exc).__name__,
                         )
 
                 except TelegramRetryAfter as exc:
@@ -3639,22 +2288,20 @@ async def followup_worker(
                         user_id,
                         exc.retry_after,
                     )
-                    await asyncio.sleep(
-                        float(exc.retry_after)
-                    )
+                    await asyncio.sleep(float(exc.retry_after))
 
                 except TelegramNetworkError as exc:
                     LOGGER.warning(
                         "Сетевая ошибка follow-up для %s: %s",
                         user_id,
-                        exc,
+                        type(exc).__name__,
                     )
 
                 except Exception as exc:
                     LOGGER.exception(
                         "Ошибка follow-up для пользователя %s: %s",
                         user_id,
-                        exc,
+                        type(exc).__name__,
                     )
 
             await asyncio.sleep(60)
@@ -3663,9 +2310,7 @@ async def followup_worker(
             break
 
         except Exception:
-            LOGGER.exception(
-                "Критическая ошибка follow-up worker"
-            )
+            LOGGER.exception("Критическая ошибка follow-up worker")
             await asyncio.sleep(60)
 
     LOGGER.info("Follow-up worker остановлен")
@@ -3685,65 +2330,48 @@ async def start_agent_bot(
     personal_data_operator: str = "",
     policy_version: str = "2026-01",
     followup_minutes: int = 25,
+    retention_days: int = 180,
     **kwargs: Any,
 ) -> None:
-    del kwargs
-
+    if kwargs:
+        raise ValueError(
+            "Неизвестные настройки start_agent_bot: " + ", ".join(sorted(kwargs))
+        )
     if admin_ids is None:
-        admin_ids = (
-            [admin_id]
-            if admin_id
-            else [929398815]
-        )
-
-    admin_ids = list(
-        dict.fromkeys(
-            int(value)
-            for value in admin_ids
-            if isinstance(value, int)
-        )
-    )
-
-    if not admin_ids:
-        admin_ids = [929398815]
-
+        admin_ids = [admin_id] if admin_id else []
+    if not admin_ids or any(
+        type(value) is not int or value <= 0 for value in admin_ids
+    ):
+        raise ValueError("Нужен явно заданный положительный ID администратора")
+    admin_ids = list(dict.fromkeys(admin_ids))
     if manager_ids is None:
         manager_ids = []
-
-    manager_ids = list(
-        dict.fromkeys(
-            int(value)
-            for value in manager_ids
-            if isinstance(value, int)
-        )
-    )
-
-    for current_admin_id in admin_ids:
-        if current_admin_id not in manager_ids:
-            manager_ids.append(current_admin_id)
-
+    if any(type(value) is not int or value <= 0 for value in manager_ids):
+        raise ValueError("Некорректный ID менеджера")
+    manager_ids = list(dict.fromkeys(admin_ids + manager_ids))
+    if not 0 <= followup_minutes <= 10080:
+        raise ValueError("Некорректный интервал напоминания")
     if crm_chat_id is None:
         crm_chat_id = admin_ids[0]
 
     if not proxy:
-        proxy = os.getenv(
-            "TELEGRAM_PROXY",
-            "",
-        ).strip() or None
+        proxy = (
+            os.getenv(
+                "TELEGRAM_PROXY",
+                "",
+            ).strip()
+            or None
+        )
 
-    init_db(db_path)
+    await asyncio.to_thread(init_db, db_path)
 
     storage = SQLiteStorage(db_path)
-    dispatcher = Dispatcher(storage=storage)
+    dispatcher = Dispatcher(storage=storage, events_isolation=SimpleEventIsolation())
     dispatcher.include_router(router)
 
     stop_event = asyncio.Event()
 
-    session = (
-        AiohttpSession(proxy=proxy)
-        if proxy
-        else AiohttpSession()
-    )
+    session = AiohttpSession(proxy=proxy) if proxy else AiohttpSession()
 
     async with Bot(
         token=token,
@@ -3769,9 +2397,8 @@ async def start_agent_bot(
         )
 
         LOGGER.info(
-            "Бот запущен. CRM-чат: %s; прокси: %s",
-            crm_chat_id,
-            proxy or "отключен",
+            "Бот запущен; прокси включён: %s",
+            bool(proxy),
         )
 
         try:
@@ -3785,6 +2412,7 @@ async def start_agent_bot(
                 privacy_policy_url=privacy_policy_url,
                 personal_data_operator=personal_data_operator,
                 policy_version=policy_version,
+                retention_days=retention_days,
             )
         finally:
             stop_event.set()
@@ -3800,3 +2428,34 @@ async def start_agent_bot(
 
             await storage.close()
             LOGGER.info("Бот корректно остановлен")
+
+
+@router.callback_query()
+async def stale_callback(callback: CallbackQuery) -> None:
+    await callback.answer(
+        "Кнопка устарела или недоступна на этом шаге. Откройте /menu.", show_alert=True
+    )
+
+
+@router.message()
+async def unknown_message(message: Message) -> None:
+    await message.answer(
+        "Используйте кнопки текущего шага. Главное меню: /menu; отмена: /cancel."
+    )
+
+
+@router.error()
+async def handle_error(event) -> bool:
+    LOGGER.error("Ошибка обработки обновления: %s", type(event.exception).__name__)
+    try:
+        if event.update.callback_query:
+            await event.update.callback_query.answer(
+                "Не удалось выполнить действие. Попробуйте ещё раз.", show_alert=True
+            )
+        elif event.update.message:
+            await event.update.message.answer(
+                "Не удалось выполнить действие. Данные сохранённой заявки остаются в базе. Попробуйте ещё раз или /menu."
+            )
+    except Exception:
+        LOGGER.error("Не удалось отправить сообщение об ошибке")
+    return True
