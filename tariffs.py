@@ -4,8 +4,10 @@ from __future__ import annotations
 from datetime import date
 import html
 import json
+import re
 from pathlib import Path
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aura_ui import DIVIDER, progress, strip_leading_icon
 
 
 def load_catalog(path: Path):
@@ -62,12 +64,18 @@ def render_tariff(key: str) -> str:
         for name in ("price_note", "speed_or_allowance", "conditions")
         if tariff.get(name)
     )
+    description = tariff["description"].replace("━━━━━━━━━━━━━━━━━━", "")
+    description = re.sub(r"\n{3,}", "\n\n", description).strip()
     return (
-        tariff["description"]
+        f"{progress(1, 'Выбор')}\n\n"
+        f"<b>{html.escape(strip_leading_icon(tariff['title']))}</b>\n"
+        f"{DIVIDER}\n\n"
+        + description
         + ("\n" + extra if extra else "")
-        + f"\n\nРегион: {html.escape(region)}. Дата проверки: {html.escape(verified)}.\n"
-        "Цены приведены из каталога проекта и требуют подтверждения. "
-        "Это не подтверждение доступности по адресу; условия проверяет специалист."
+        + f"\n\n<blockquote>Регион · {html.escape(region)}\n"
+        f"Проверено · {html.escape(verified)}</blockquote>\n"
+        "Стоимость и условия требуют подтверждения. Доступность по адресу "
+        "проверяет специалист."
     )
 
 
@@ -76,31 +84,31 @@ def get_categories_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📺 Связь, ТВ и интернет", callback_data="cat:combo"
+                    text="Интернет и ТВ", callback_data="cat:combo"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="📱 Мобильная связь", callback_data="cat:mobile"
+                    text="Мобильная связь", callback_data="cat:mobile"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="📟 Для устройств", callback_data="cat:devices"
+                    text="Оборудование и устройства", callback_data="cat:devices"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="📡 Спутниковое ТВ", callback_data="cat:satellite_tv"
+                    text="Телевидение", callback_data="cat:satellite_tv"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="💼 Тарифы для бизнеса", callback_data="cat:business"
+                    text="Бизнес", callback_data="cat:business"
                 )
             ],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_order")],
+            [InlineKeyboardButton(text="Главное меню", callback_data="main_menu")],
+            [InlineKeyboardButton(text="Отменить", callback_data="cancel_order")],
         ]
     )
 
@@ -123,9 +131,9 @@ def get_tariffs_by_category_kb(category_key: str) -> InlineKeyboardMarkup:
         buttons.append(
             [
                 InlineKeyboardButton(
-                    text=item["title"]
+                    text=strip_leading_icon(item["title"])
                     if item.get("has_variants")
-                    else TARIFFS[item["id"]]["title"],
+                    else strip_leading_icon(TARIFFS[item["id"]]["title"]),
                     callback_data=cb_data,
                 )
             ]
@@ -134,15 +142,15 @@ def get_tariffs_by_category_kb(category_key: str) -> InlineKeyboardMarkup:
     buttons.append(
         [
             InlineKeyboardButton(
-                text="⬅️ Назад к категориям", callback_data="action_back_categories"
+                text="← Все направления", callback_data="action_back_categories"
             )
         ]
     )
     buttons.append(
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
+        [InlineKeyboardButton(text="Главное меню", callback_data="main_menu")]
     )
     buttons.append(
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_order")]
+        [InlineKeyboardButton(text="Отменить", callback_data="cancel_order")]
     )
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -159,7 +167,7 @@ def get_variants_kb(tariff_item_id: str) -> tuple[str, InlineKeyboardMarkup] | N
                     buttons.append(
                         [
                             InlineKeyboardButton(
-                                text=TARIFFS[v["key"]]["title"],
+                                text=strip_leading_icon(TARIFFS[v["key"]]["title"]),
                                 callback_data=f"service:{v['key']}",
                             )
                         ]
@@ -167,11 +175,11 @@ def get_variants_kb(tariff_item_id: str) -> tuple[str, InlineKeyboardMarkup] | N
                 buttons.append(
                     [
                         InlineKeyboardButton(
-                            text="⬅️ Назад к тарифам",
+                            text="← Назад",
                             callback_data="action_back_tariffs",
                         ),
                         InlineKeyboardButton(
-                            text="❌ Отмена", callback_data="cancel_order"
+                            text="Отменить", callback_data="cancel_order"
                         ),
                     ]
                 )
@@ -184,19 +192,19 @@ def get_tariff_actions_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🚀 Хочу подключить", callback_data="action_order"
+                    text="Выбрать предложение", callback_data="action_order"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="📞 Нужна консультация", callback_data="action_call"
+                    text="Обсудить со специалистом", callback_data="action_call"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Другой тариф", callback_data="action_back_tariffs"
+                    text="← Другой тариф", callback_data="action_back_tariffs"
                 ),
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_order"),
+                InlineKeyboardButton(text="Отменить", callback_data="cancel_order"),
             ],
         ]
     )

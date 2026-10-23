@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#09090C">
+  <meta name="color-scheme" content="dark light">
+  <title>МТС Экспресс · AURA CORE</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="ambient ambient-a"></div><div class="ambient ambient-b"></div>
+  <main class="shell">
+    <header class="topbar">
+      <a class="wordmark" href="#top" aria-label="На главную"><span></span>МТС ЭКСПРЕСС</a>
+      <button class="text-button" type="button" data-open-consultation>Консультация</button>
+    </header>
+
+    <section class="hero" id="top">
+      <div class="hero-copy">
+        <p class="eyebrow">AURA CORE · CONNECTIONS 2026</p>
+        <h1>Связь.<br><em>Без компромиссов.</em></h1>
+        <p class="lead">Твой тариф. Твои правила. Выберите направление — условия и доступность подтвердит специалист.</p>
+        <button class="primary" type="button" data-scroll-catalog>Выбрать услугу <span>↘</span></button>
+      </div>
+      <picture class="hero-art"><img src="assets/cover.svg" alt="Абстрактная тёмная композиция с алым светом"></picture>
+    </section>
+
+    <section class="catalog" id="catalog">
+      <div class="section-heading"><p class="eyebrow">01 / НАПРАВЛЕНИЯ</p><h2>Выбирай больше.</h2></div>
+      <div class="service-grid">
+        <button class="service-card wide" data-category="combo" type="button">
+          <img src="assets/internet.svg" alt=""><span class="card-index">01</span><strong>Интернет</strong><small>Дом, скорость, развлечения</small>
+        </button>
+        <button class="service-card" data-category="mobile" type="button">
+          <img src="assets/mobile.svg" alt=""><span class="card-index">02</span><strong>Мобильная связь</strong><small>Твой ритм. Твои правила.</small>
+        </button>
+        <button class="service-card" data-category="satellite_tv" type="button">
+          <img src="assets/tv.svg" alt=""><span class="card-index">03</span><strong>Телевидение</strong><small>Контент без лишнего шума</small>
+        </button>
+        <button class="service-card wide" data-category="business" type="button">
+          <img src="assets/business.svg" alt=""><span class="card-index">04</span><strong>Бизнес</strong><small>Связь для системного роста</small>
+        </button>
+        <button class="service-card quiet" data-category="devices" type="button">
+          <span class="card-index">05</span><strong>Оборудование</strong><small>Устройства всегда на связи</small>
+        </button>
+      </div>
+    </section>
+
+    <section class="trust-strip" aria-label="Принципы сервиса">
+      <p><span>01</span> Прозрачные условия</p><p><span>02</span> Подтверждение доступности</p><p><span>03</span> Защита данных</p>
+    </section>
+  </main>
+
+  <dialog id="sheet">
+    <form method="dialog" class="sheet-head"><p class="eyebrow" id="sheet-kicker">ПРЕДЛОЖЕНИЯ</p><button aria-label="Закрыть">×</button></form>
+    <div id="sheet-content"></div>
+  </dialog>
+
+  <template id="tariff-template">
+    <article class="tariff-card"><p class="tariff-meta"></p><h3></h3><p class="tariff-copy"></p><button class="secondary" type="button">Выбрать</button></article>
+  </template>
+  <script src="app.js" defer></script>
+</body>
+</html>
