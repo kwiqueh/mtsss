@@ -89,6 +89,13 @@ from database import (
 )
 from aiogram.fsm.storage.memory import SimpleEventIsolation
 from exports import sanitize_excel_cell as sanitize_excel_cell
+from aura_ui import (
+    SECTION_TO_CATEGORY,
+    category_text,
+    data_step,
+    home_text,
+    progress,
+)
 from tariffs import (
     render_tariff,
     tariff_available,
@@ -311,16 +318,29 @@ def get_start_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🚀 Подобрать тариф и подключение",
-                    callback_data="start_process",
-                )
+                    text="Интернет", callback_data="section:internet"
+                ),
+                InlineKeyboardButton(
+                    text="Мобильная связь", callback_data="section:mobile"
+                ),
             ],
             [
                 InlineKeyboardButton(
-                    text="📞 Получить консультацию", callback_data="consultation"
+                    text="Телевидение", callback_data="section:tv"
+                ),
+                InlineKeyboardButton(text="Бизнес", callback_data="section:business"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Оборудование", callback_data="section:equipment"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Получить консультацию", callback_data="consultation"
                 )
             ],
-            [InlineKeyboardButton(text="🔐 О данных", callback_data="privacy_info")],
+            [InlineKeyboardButton(text="О данных", callback_data="privacy_info")],
         ]
     )
 
@@ -351,25 +371,25 @@ def get_time_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🌅 Утро (09:00–12:00)",
+                    text="Утро · 09:00–12:00",
                     callback_data="time_morning",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="☀️ День (12:00–17:00)",
+                    text="День · 12:00–17:00",
                     callback_data="time_day",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🌙 Вечер (17:00–21:00)",
+                    text="Вечер · 17:00–21:00",
                     callback_data="time_evening",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⚡ В любое время",
+                    text="В любое время",
                     callback_data="time_any",
                 )
             ],
@@ -385,23 +405,23 @@ def get_consent_kb(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅ Отправить заявку",
+                    text="Подтвердить и отправить",
                     callback_data=f"consent_accept:{submission_id}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="✏️ Изменить данные",
+                    text="Изменить данные",
                     callback_data="consent_edit",
                 )
             ],
             [
-                InlineKeyboardButton(text="⬅️ Назад", callback_data="form_back"),
-                InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu"),
+                InlineKeyboardButton(text="← Назад", callback_data="form_back"),
+                InlineKeyboardButton(text="Главное меню", callback_data="main_menu"),
             ],
             [
                 InlineKeyboardButton(
-                    text="📄 Политика обработки ПДн",
+                    text="Условия обработки данных",
                     url=privacy_policy_url,
                 )
             ],
@@ -413,12 +433,12 @@ def cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="⬅️ Назад", callback_data="form_back"),
-                InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu"),
+                InlineKeyboardButton(text="← Назад", callback_data="form_back"),
+                InlineKeyboardButton(text="Главное меню", callback_data="main_menu"),
             ],
             [
                 InlineKeyboardButton(
-                    text="❌ Отменить",
+                    text="Отменить оформление",
                     callback_data="cancel_order",
                 )
             ],
@@ -431,13 +451,14 @@ def consent_text(
     personal_data_operator: str,
 ) -> str:
     return (
-        "🔎 <b>Проверьте данные заявки</b>\n\n"
-        f"🎯 Тип: <b>{html.escape(str(data.get('action_type', 'Подключение')))}</b>\n"
-        f"🏠 Адрес: <b>{html.escape(str(data.get('address', '')))}</b>\n"
-        f"📦 Услуга: <b>{html.escape(str(data.get('service', '')))}</b>\n"
-        f"👤 Имя: <b>{html.escape(str(data.get('name', '')))}</b>\n"
-        f"📞 Телефон: <code>{html.escape(str(data.get('phone', '')))}</code>\n"
-        f"⏰ Время звонка: <b>{html.escape(str(data.get('call_time', '')))}</b>\n\n"
+        f"{progress(3, 'Проверка')}\n\n"
+        "<b>Всё верно?</b>\n\n"
+        f"Тип · <b>{html.escape(str(data.get('action_type', 'Подключение')))}</b>\n"
+        f"Адрес · <b>{html.escape(str(data.get('address') or 'не требуется'))}</b>\n"
+        f"Услуга · <b>{html.escape(str(data.get('service', '')))}</b>\n"
+        f"Имя · <b>{html.escape(str(data.get('name', '')))}</b>\n"
+        f"Телефон · <code>{html.escape(str(data.get('phone', '')))}</code>\n"
+        f"Звонок · <b>{html.escape(str(data.get('call_time', '')))}</b>\n\n"
         "Нажимая кнопку «Отправить заявку», вы даёте согласие "
         "на обработку указанных персональных данных для связи "
         "по вопросу подключения услуг.\n\n"
@@ -548,8 +569,8 @@ router.callback_query.outer_middleware(CustomerContextMiddleware())
 async def cmd_menu(message: Message, state: FSMContext, db_path: str) -> None:
     await state.clear()
     await cancel_funnel_session(db_path, message.from_user.id)
-    await message.answer("Главное меню", reply_markup=ReplyKeyboardRemove())
-    await message.answer("Выберите действие:", reply_markup=get_start_kb())
+    await message.answer("<b>МТС ЭКСПРЕСС</b>\nВыберите направление.", parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Ничего лишнего. Только то, что нужно.", reply_markup=get_start_kb())
 
 
 @router.callback_query(F.data == "main_menu")
@@ -561,9 +582,9 @@ async def callback_menu(
         await state.clear()
         await cancel_funnel_session(db_path, callback.from_user.id)
         await callback.message.answer(
-            "Главное меню", reply_markup=ReplyKeyboardRemove()
+            "<b>МТС ЭКСПРЕСС</b>\nВыберите направление.", parse_mode="HTML", reply_markup=ReplyKeyboardRemove()
         )
-        await callback.message.answer("Выберите действие:", reply_markup=get_start_kb())
+        await callback.message.answer("Ничего лишнего. Только то, что нужно.", reply_markup=get_start_kb())
 
 
 @router.callback_query(F.data == "privacy_info")
@@ -583,6 +604,60 @@ async def privacy_info(
             f'<a href="{html.escape(privacy_policy_url, quote=True)}">Политика обработки данных</a>',
             parse_mode="HTML",
         )
+
+
+@router.callback_query(F.data.startswith("section:"))
+async def open_home_section(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_path: str,
+) -> None:
+    """Open a catalog section directly from the AURA CORE home screen."""
+    if callback.message is None:
+        await callback.answer("Сообщение недоступно.", show_alert=True)
+        return
+
+    section = (callback.data or "").split(":", 1)[-1]
+    category_key = SECTION_TO_CATEGORY.get(section)
+    category = CATEGORIES_INFO.get(category_key or "")
+    if category_key is None or category is None:
+        await callback.answer(
+            "Раздел изменился. Откройте главное меню ещё раз.", show_alert=True
+        )
+        return
+
+    await callback.answer()
+    tag, code, name, house = await asyncio.to_thread(
+        remember_attribution_sync, db_path, callback.from_user.id, None
+    )
+    await state.clear()
+    await state.update_data(
+        ref_tag=tag,
+        agent_code=code,
+        agent_name=name,
+        house_tag=house,
+        submission_id=uuid.uuid4().hex,
+        address="",
+        selected_category=category_key,
+    )
+    await state.set_state(OrderFSM.waiting_for_service)
+    await reset_funnel_session(
+        db_path,
+        callback.from_user.id,
+        tag,
+        OrderFSM.waiting_for_service.state,
+    )
+    await record_event(
+        db_path=db_path,
+        user_id=callback.from_user.id,
+        ref_tag=tag,
+        event_name="category_selected",
+    )
+    await callback.message.edit_text(
+        category_text(category),
+        reply_markup=get_tariffs_by_category_kb(category_key),
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("delete_me"))
@@ -628,7 +703,9 @@ async def consultation(
         db_path, callback.from_user.id, tag, OrderFSM.waiting_for_name.state
     )
     await callback.message.answer(
-        "Для консультации достаточно имени, телефона и времени звонка. "
+        f"{progress(2, 'Данные')}\n\n"
+        "<b>Персональная консультация</b>\n"
+        "Имя, телефон и удобное время — этого достаточно.\n\n"
         f"Оператор данных: {html.escape(personal_data_operator)}. "
         f'<a href="{html.escape(privacy_policy_url, quote=True)}">Политика обработки данных</a>\n\n'
         "Как к вам обращаться?",
@@ -982,13 +1059,11 @@ async def cmd_start(
         )
 
     await message.answer(
-        f"👋 <b>Здравствуйте!</b>{welcome_agent}\n\n"
-        "Это сервис «МТС Экспресс» для заявок на услуги связи.\n\n"
-        "Подберём выгодный тариф и передадим заявку специалисту "
-        "после уточнения региона и условий. Доступность подключения проверяет специалист.\n\n"
-        f"Контакты для ответа обрабатывает {html.escape(personal_data_operator)}. "
-        f'<a href="{html.escape(privacy_policy_url, quote=True)}">Политика обработки данных</a>. '
-        "Запросить удаление: /delete_me.",
+        home_text(
+            personal_data_operator=personal_data_operator,
+            privacy_policy_url=privacy_policy_url,
+            consultant_name=agent_name if welcome_agent else "",
+        ),
         reply_markup=get_start_kb(),
         parse_mode="HTML",
     )
@@ -1254,9 +1329,7 @@ async def process_category(
     await state.set_state(OrderFSM.waiting_for_service)
 
     await callback.message.edit_text(
-        f"📂 <b>{html.escape(category_info['name'])}</b>\n"
-        f"<i>{html.escape(category_info['desc'])}</i>\n\n"
-        "👇 Выберите интересующий тариф:",
+        category_text(category_info),
         reply_markup=get_tariffs_by_category_kb(category_key),
         parse_mode="HTML",
     )
@@ -1281,7 +1354,7 @@ async def process_back_to_categories(
     await state.set_state(OrderFSM.choosing_category)
 
     await callback.message.edit_text(
-        "📋 <b>ВЫБЕРИТЕ КАТЕГОРИЮ УСЛУГ:</b>",
+        f"{progress(1, 'Выбор')}\n\n<b>Выберите направление</b>",
         reply_markup=get_categories_kb(),
         parse_mode="HTML",
     )
@@ -1417,9 +1490,7 @@ async def process_back_tariffs(
     await state.set_state(OrderFSM.waiting_for_service)
 
     await callback.message.edit_text(
-        f"📂 <b>{html.escape(category_info['name'])}</b>\n"
-        f"<i>{html.escape(category_info['desc'])}</i>\n\n"
-        "👇 Выберите интересующий тариф:",
+        category_text(category_info),
         reply_markup=get_tariffs_by_category_kb(category_key),
         parse_mode="HTML",
     )
@@ -1451,15 +1522,20 @@ async def process_action(
     ):
         await state.set_state(OrderFSM.waiting_for_address)
         await callback.message.answer(
-            "Для проверки возможности подключения напишите город, улицу и номер дома. Номер квартиры не нужен. Доступность подтвердит специалист.",
+            data_step(
+                "Адрес подключения",
+                "Напишите город, улицу и номер дома. Квартира не нужна. "
+                "Возможность подключения подтвердит специалист.",
+            ),
             reply_markup=cancel_kb(),
+            parse_mode="HTML",
         )
         return
     await state.update_data(address="")
     await state.set_state(OrderFSM.waiting_for_name)
 
     await callback.message.answer(
-        "👤 <b>Шаг 3 из 6. Как к вам обращаться?</b>\n\nНапишите имя.",
+        data_step("Как к вам обращаться?", "Напишите имя."),
         reply_markup=cancel_kb(),
         parse_mode="HTML",
     )
@@ -1484,11 +1560,11 @@ async def process_name(
     await state.set_state(OrderFSM.waiting_for_phone)
 
     await message.answer(
-        f"Приятно познакомиться, "
-        f"<b>{html.escape(name)}</b>!\n\n"
-        "📞 <b>Шаг 4 из 6. Номер телефона</b>\n\n"
-        "Номер нужен только для связи по заявке.\n"
-        "Можно нажать кнопку внизу или ввести номер вручную.",
+        data_step(
+            f"{name}, оставьте номер",
+            "Он нужен только для связи по заявке. Нажмите кнопку внизу "
+            "или введите номер вручную.",
+        ),
         reply_markup=get_phone_kb(),
         parse_mode="HTML",
     )
@@ -1535,15 +1611,12 @@ async def process_phone(
     await state.set_state(OrderFSM.waiting_for_call_time)
 
     await message.answer(
-        "✅ Номер принят.\n\n⏰ <b>Шаг 5 из 6. Когда удобно принять звонок?</b>",
+        data_step("Когда удобно принять звонок?", "Выберите один диапазон."),
         reply_markup=ReplyKeyboardRemove(),
         parse_mode="HTML",
     )
 
-    await message.answer(
-        "Выберите удобный диапазон:",
-        reply_markup=get_time_kb(),
-    )
+    await message.answer("Выберите время:", reply_markup=get_time_kb())
 
 
 @router.callback_query(
@@ -1718,11 +1791,12 @@ async def process_consent_accept(
         )
 
     await callback.message.answer(
-        f"🎉 <b>Заявка №{lead_id} принята!</b>\n\n"
+        f"{progress(4, 'Готово')}\n\n"
+        f"<b>Заявка №{lead_id} принята</b>\n\n"
         f"Специалист <b>{html.escape(str(consultant_name))}</b> "
         "получит заявку и уточнит условия подключения. Удобное время звонка:\n"
         f"<b>{html.escape(str(data['call_time']))}</b>\n\n"
-        f"Номер для связи: "
+        f"Номер для связи · "
         f"<code>{html.escape(str(data['phone']))}</code>"
         f"{duplicate_text}",
         parse_mode="HTML",

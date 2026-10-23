@@ -28,6 +28,7 @@ from export_leads import export_csv
 from exports import sanitize_excel_cell
 from runtime import instance_lock
 import tariffs
+import aura_ui
 
 # Deliberately synthetic format fixture, never sent to Telegram.
 TEST_TOKEN = "123456789:" + "x" * 35
@@ -388,6 +389,29 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
                 c.execute("SELECT COUNT(*) FROM lead_status_history").fetchone()[0], 0
             )
 
+    async def test_aura_direct_section_starts_existing_funnel(self):
+        callback = AsyncMock()
+        callback.data = "section:internet"
+        callback.from_user.id = 777
+        callback.message = AsyncMock()
+        state = AsyncMock()
+        await bot.open_home_section(callback, state, self.path)
+        state.set_state.assert_awaited_once_with(bot.OrderFSM.waiting_for_service)
+        state.update_data.assert_awaited_once()
+        values = state.update_data.await_args.kwargs
+        self.assertEqual(values["selected_category"], "combo")
+        callback.message.edit_text.assert_awaited_once()
+        rendered = callback.message.edit_text.await_args.args[0]
+        self.assertIn("01 / 04", rendered)
+        with db.connect(self.path) as connection:
+            session = connection.execute(
+                "SELECT current_step, completed, cancelled "
+                "FROM funnel_sessions WHERE user_id=777"
+            ).fetchone()
+        self.assertEqual(
+            tuple(session), (bot.OrderFSM.waiting_for_service.state, 0, 0)
+        )
+
     async def test_export_group_blocked(self):
         message = AsyncMock()
         message.from_user.id = 100
@@ -713,6 +737,54 @@ class TariffTests(unittest.TestCase):
                     for button in row
                 )
             )
+
+
+class AuraCoreTests(unittest.TestCase):
+    def test_progress_and_copy_are_safe(self):
+        self.assertIn("03 / 04", aura_ui.progress(3, "Проверка"))
+        with self.assertRaises(ValueError):
+            aura_ui.progress(0, "Ошибка")
+        text = aura_ui.home_text("Оператор <тест>", "https://example.org/?a=1&b=2")
+        self.assertIn("Связь. Без компромиссов.", text)
+        self.assertNotIn("Оператор <тест>", text)
+        self.assertIn("&amp;", text)
+
+    def test_home_menu_has_six_direct_actions(self):
+        callbacks = [
+            button.callback_data
+            for row in bot.get_start_kb().inline_keyboard
+            for button in row
+            if button.callback_data != "privacy_info"
+        ]
+        self.assertEqual(
+            callbacks,
+            [
+                "section:internet",
+                "section:mobile",
+                "section:tv",
+                "section:business",
+                "section:equipment",
+                "consultation",
+            ],
+        )
+        self.assertEqual(set(aura_ui.SECTION_TO_CATEGORY.values()), set(tariffs.CATEGORIES_INFO))
+
+    def test_tariff_cards_keep_confirmation_and_clean_buttons(self):
+        text = tariffs.render_tariff("mobile_red")
+        self.assertIn("01 / 04", text)
+        self.assertIn("требуют подтверждения", text)
+        keyboard = tariffs.get_tariffs_by_category_kb("mobile")
+        labels = [button.text for row in keyboard.inline_keyboard for button in row]
+        self.assertIn("Тариф RED", labels)
+
+    def test_mini_app_prototype_is_local_and_non_submitting(self):
+        root = Path(__file__).parents[1] / "miniapp"
+        self.assertTrue((root / "index.html").is_file())
+        self.assertTrue((root / "styles.css").is_file())
+        script = (root / "app.js").read_text(encoding="utf-8")
+        self.assertIn('../tariff_data.json', script)
+        self.assertNotIn("fetch(\"/api", script)
+        self.assertEqual(len(list((root / "assets").glob("*.svg"))), 5)
 
 
 if __name__ == "__main__":
